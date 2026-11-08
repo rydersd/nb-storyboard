@@ -1,0 +1,187 @@
+{
+  "schema": "nb-storyboard/v1",
+  "title": "Small",
+  "fps": 24,
+  "format": {
+    "width": 1440,
+    "height": 900
+  },
+  "scenes": [
+    {
+      "id": "scene-1",
+      "title": "Arrival",
+      "shots": [
+        {
+          "id": "shot-1",
+          "title": "Door",
+          "duration": 2.0,
+          "selected_take": "take-1",
+          "takes": [
+            {
+              "id": "take-1",
+              "name": "Wide",
+              "panels": [
+                {
+                  "id": "panel-1",
+                  "time": 0.0,
+                  "title": "Door opens",
+                  "background": "#111111",
+                  "layers": [
+                    {
+                      "id": "layer-1",
+                      "type": "solid",
+                      "x": 0.0,
+                      "y": 0.0,
+                      "width": 1440.0,
+                      "height": 900.0,
+                      "fill": "#222222"
+                    }
+                  ],
+                  "strokes": [
+                    {
+                      "color": "white",
+                      "width": 2.0,
+                      "points": [[1.0,2.0],[3.0,4.0]]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "take-2",
+              "name": "Close",
+              "panels": [
+                {
+                  "id": "panel-2",
+                  "time": 0.0
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "shot-2",
+          "title": "Look",
+          "duration": 1.0,
+          "selected_take": "take-3",
+          "takes": [
+            {
+              "id": "take-3",
+              "name": "Main",
+              "panels": [
+                {
+                  "id": "panel-3",
+                  "time": 0.0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "scene-2",
+      "title": "Exit",
+      "shots": [
+        {
+          "id": "shot-3",
+          "title": "Turn",
+          "duration": 1.0,
+          "selected_take": "take-4",
+          "takes": [
+            {
+              "id": "take-4",
+              "name": "Main",
+              "panels": [
+                {
+                  "id": "panel-4",
+                  "time": 0.0
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "shot-4",
+          "title": "Leave",
+          "duration": 1.0,
+          "selected_take": "take-5",
+          "takes": [
+            {
+              "id": "take-5",
+              "name": "Main",
+              "panels": [
+                {
+                  "id": "panel-5",
+                  "time": 0.0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "cuts": [
+    {
+      "id": "cut-main",
+      "name": "Main",
+      "clips": [
+        {
+          "id": "clip-1",
+          "source": {
+            "shot": {
+              "shot": "shot-1"
+            }
+          }
+        },
+        {
+          "id": "clip-2",
+          "source": {
+            "cut": {
+              "cut": "cut-alt"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "cut-alt",
+      "name": "Alt",
+      "clips": [
+        {
+          "id": "clip-3",
+          "source": {
+            "shot": {
+              "shot": "shot-3",
+              "take": "take-4"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "active_cut": "cut-main",
+  "stickies": [
+    {
+      "id": "sticky-1",
+      "text": "Check framing",
+      "kind": "todo",
+      "author": "human",
+      "pin": "panel:shot-1/take-1/panel-1",
+      "created": "2026-11-07T00:00:00Z"
+    }
+  ],
+  "layout": {
+    "positions": {
+      "cut:cut-alt": {
+        "x": 30.0,
+        "y": 40.0
+      },
+      "shot:shot-1": {
+        "x": 10.0,
+        "y": 20.0
+      }
+    }
+  }
+}

@@ -1,0 +1,26 @@
+[package]
+name = "storyboard-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+render = ["storyboard-core/render"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+notify.workspace = true
+image.workspace = true
+storyboard-core = { path = "../storyboard-core" }
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3.26.0"
