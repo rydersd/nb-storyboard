@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 use storyboard_core::{ClipSource, CutSource, Op, ShotSource};
-use storyboard_store::{import_source, scan_sources};
+use storyboard_store::import_source;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
@@ -31,6 +31,8 @@ pub fn run(command: Command) -> Result<Value, ApiError> {
                 index: a.index,
             },
         ),
+        Command::RemoveScene(a) => write(&a.write, ops_api::remove_scene_op(a.scene)),
+        Command::RemoveShot(a) => write(&a.write, ops_api::remove_shot_op(a.shot)),
         Command::AddPanel(a) => {
             let op = ops_api::add_panel_op(
                 &a.write.dir,
@@ -41,6 +43,11 @@ pub fn run(command: Command) -> Result<Value, ApiError> {
                 a.time,
                 a.index,
             )?;
+            write(&a.write, op)
+        }
+        Command::RemovePanel(a) => {
+            let op =
+                ops_api::remove_panel_op(&a.write.dir, a.shot, a.take, a.panel, a.at.as_deref())?;
             write(&a.write, op)
         }
         Command::AddText(a) => {
@@ -76,18 +83,21 @@ pub fn run(command: Command) -> Result<Value, ApiError> {
             )?;
             write(&a.write, op)
         }
+        Command::RemoveLayer(a) => {
+            let op = ops_api::remove_layer_op(
+                &a.write.dir,
+                a.shot,
+                a.take,
+                a.panel,
+                a.at.as_deref(),
+                a.layer,
+            )?;
+            write(&a.write, op)
+        }
         Command::Import(a) => Ok(
             json!({"path": import_source(&a.dir, &a.source, &std::path::PathBuf::from("sources").join(a.destination))?}),
         ),
-        Command::Sources(a) => Ok(json!({"sources": scan_sources(&a.dir)?})),
-        Command::MoveShot(a) => write(
-            &a.write,
-            Op::MoveShotBetweenScenes {
-                shot: a.shot,
-                scene: a.scene,
-                index: a.index,
-            },
-        ),
+        Command::Sources(a) => ops_api::sources_result(&a.dir),
         Command::AddTake(a) => write(
             &a.write,
             Op::AddTake {
@@ -153,10 +163,35 @@ pub fn run(command: Command) -> Result<Value, ApiError> {
                 clip: a.clip,
             },
         ),
+        Command::ReorderClip(a) => {
+            write(&a.write, ops_api::reorder_clip_op(a.cut, a.clip, a.index))
+        }
+        Command::SetActiveCut(a) => {
+            let op = ops_api::set_active_cut_op(a.cut, a.story)?;
+            write(&a.write, op)
+        }
         Command::SetShot(a) => {
             let op = ops_api::set_shot_op(
                 a.shot, a.title, a.action, a.dialogue, a.speaker, a.camera, a.notes, a.duration,
             )?;
+            write(&a.write, op)
+        }
+        Command::MoveShotToScene(a) => write(
+            &a.write,
+            ops_api::move_shot_to_scene_op(a.shot, a.scene, a.index),
+        ),
+        Command::ReorderShot(a) => write(&a.write, ops_api::reorder_shot_op(a.shot, a.index)),
+        Command::AddRef(a) => ops_api::commit_add_ref(
+            &a.write.dir,
+            &a.write.base_version,
+            a.shot,
+            a.take,
+            &a.reference,
+            ops_api::author(a.write.author)?,
+            a.write.note,
+        ),
+        Command::RemoveRef(a) => {
+            let op = ops_api::ref_op(a.shot, a.take, &a.reference, false)?;
             write(&a.write, op)
         }
         Command::SelectTake(a) => write(
@@ -178,6 +213,7 @@ pub fn run(command: Command) -> Result<Value, ApiError> {
         ),
         Command::History(a) => ops_api::history_result(&a.dir, a.limit, a.full),
         Command::Show(a) => ops_api::show(&a.dir, a.cut.as_deref()),
+        Command::Describe(a) => ops_api::describe(&a.dir, a.shot, a.take, a.panel, a.at.as_deref()),
         Command::PanelImage(a) => ops_api::panel_image(a),
         Command::CutSheet(a) => ops_api::cut_sheet(a),
         Command::Note(a) => write(
@@ -203,9 +239,15 @@ pub fn run(command: Command) -> Result<Value, ApiError> {
             },
         ),
         Command::Resolve(a) => write(&a.write, Op::ResolveSticky { sticky: a.sticky }),
-        Command::Notes(a) => {
-            ops_api::notes_result(&a.dir, a.kind, a.author, a.pin, a.resolved, a.unresolved)
-        }
+        Command::Notes(a) => ops_api::notes_result(
+            &a.dir,
+            a.kind,
+            a.author,
+            a.pin,
+            a.resolved,
+            a.unresolved,
+            a.all,
+        ),
         Command::Schema(a) => ops_api::schema(a.op.as_deref()),
     }
 }

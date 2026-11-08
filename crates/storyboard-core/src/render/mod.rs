@@ -497,6 +497,10 @@ fn render_one(
     let scale = width as f32 / project.format.width.max(1) as f32;
     if context.panel.layers.is_empty() && context.panel.strokes.is_empty() {
         empty_placeholder(&mut pixmap, width, image_height);
+        warnings.push(Warning {
+            field: context.document_path.clone(),
+            message: "panel is empty; placeholder drawn".into(),
+        });
     }
     for (index, layer) in context.panel.layers.iter().enumerate() {
         if !layer.hidden {

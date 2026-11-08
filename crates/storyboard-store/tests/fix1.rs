@@ -580,29 +580,30 @@ fn cache_prunes_render_entries_not_used_by_the_current_project() {
 
 #[test]
 fn store_times_are_rfc3339_utc_strings() {
-    let directory = project();
-    let initial = open(directory.path()).expect("open").version;
-    let record = commit_one(directory.path(), &initial, add_scene("scene-1"));
+    let workspace_directory = tempfile::tempdir().expect("workspace");
+    let project_directory = workspace_directory.path().join("project");
+    create(&project_directory, "Test project", 24, format()).expect("create project");
+    let initial = open(&project_directory).expect("open").version;
+    let record = commit_one(&project_directory, &initial, add_scene("scene-1"));
     assert!(
         record.at.contains('T') && record.at.ends_with('Z'),
         "{}",
         record.at
     );
 
-    fs::write(directory.path().join("sources/a.txt"), b"a").expect("source");
-    let source = scan_sources(directory.path()).expect("scan").remove(0);
+    fs::write(project_directory.join("sources/a.txt"), b"a").expect("source");
+    let source = scan_sources(&project_directory).expect("scan").remove(0);
     assert!(
         source.modified.contains('T') && source.modified.ends_with('Z'),
         "{}",
         source.modified
     );
 
-    let workspace_root = directory.path().parent().expect("workspace root");
-    let workspace = open_workspace(workspace_root).expect("workspace");
+    let workspace = open_workspace(workspace_directory.path()).expect("workspace");
     let entry = index(&workspace)
         .expect("index")
         .into_iter()
-        .find(|entry| directory.path().ends_with(&entry.path))
+        .find(|entry| entry.path == Path::new("project"))
         .expect("entry");
     assert!(
         entry.modified.contains('T') && entry.modified.ends_with('Z'),
@@ -772,7 +773,7 @@ fn commit_reports_landed_without_log_and_recovery_keeps_known_author() {
 }
 
 #[test]
-fn recovered_commit_without_authorship_is_not_attributed_to_a_human() {
+fn external_hand_edit_without_commit_metadata_is_attributed_to_human() {
     let directory = project();
     let initial = open(directory.path()).expect("open").version;
     let first = commit_one(directory.path(), &initial, add_scene("scene-1"));
@@ -794,8 +795,7 @@ fn recovered_commit_without_authorship_is_not_attributed_to_a_human() {
         .into_iter()
         .find(|record| record.version == orphaned_version)
         .expect("recovered record");
-    assert_ne!(recovered.author, Author::Human);
-    assert!(format!("{:?}", recovered.author).contains("recovered"));
+    assert_eq!(recovered.author, Author::Human);
     assert_eq!(recovered.parent, first.version);
 }
 

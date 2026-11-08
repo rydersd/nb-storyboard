@@ -67,6 +67,17 @@ impl Mcp {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn raw_line(&mut self, line: &str) -> Value {
+        writeln!(self.input, "{line}").expect("write raw MCP line");
+        self.input.flush().expect("flush raw MCP line");
+        let mut response = String::new();
+        self.output
+            .read_line(&mut response)
+            .expect("read raw MCP response");
+        serde_json::from_str(&response).expect("MCP JSON response")
+    }
+
     fn notify(&mut self, method: &str, params: Value) {
         self.send(json!({"jsonrpc":"2.0","method":method,"params":params}));
     }

@@ -81,7 +81,14 @@ pub fn import_source(dir: &Path, source: &Path, destination: &Path) -> Result<Pa
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&target)?;
+        .open(&target)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                StoreError::SourceCollision(relative.clone())
+            } else {
+                StoreError::Io(error)
+            }
+        })?;
     if let Err(error) = io::copy(&mut input, &mut output) {
         drop(output);
         let _ = fs::remove_file(&target);

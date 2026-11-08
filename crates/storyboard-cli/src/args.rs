@@ -10,7 +10,7 @@ use schemars::JsonSchema;
     version
 )]
 pub struct Cli {
-    #[arg(long, global = true, help = "Print a readable table for show only")]
+    #[arg(long, global = true, help = "Print readable text for show only")]
     pub pretty: bool,
     #[command(subcommand)]
     pub command: Command,
@@ -38,12 +38,20 @@ pub enum Command {
     AddScene(AddSceneArgs),
     #[command(about = "Add a shot with a take and blank panel")]
     AddShot(AddShotArgs),
+    #[command(about = "Remove a scene")]
+    RemoveScene(RemoveSceneArgs),
+    #[command(about = "Remove a shot")]
+    RemoveShot(RemoveShotArgs),
     #[command(about = "Add a panel to a take")]
     AddPanel(AddPanelArgs),
+    #[command(about = "Remove a panel from a take")]
+    RemovePanel(RemovePanelArgs),
     #[command(about = "Add a text layer")]
     AddText(AddTextArgs),
     #[command(about = "Add an image layer")]
     AddImage(AddImageArgs),
+    #[command(about = "Remove a layer from a panel")]
+    RemoveLayer(RemoveLayerArgs),
     #[command(about = "Copy a file into sources/")]
     Import(ImportArgs),
     #[command(about = "Scan source files and their uses")]
@@ -62,10 +70,20 @@ pub enum Command {
     UpdateClip(UpdateClipArgs),
     #[command(about = "Remove a clip")]
     RemoveClip(RemoveClipArgs),
+    #[command(about = "Reorder a clip within a cut")]
+    ReorderClip(ReorderClipArgs),
+    #[command(about = "Choose the active cut or return to story order")]
+    SetActiveCut(SetActiveCutArgs),
     #[command(about = "Set a shot's story fields")]
     SetShot(SetShotArgs),
-    #[command(about = "Move a shot to a scene")]
-    MoveShot(MoveShotArgs),
+    #[command(about = "Move a shot to another scene", alias = "move-shot")]
+    MoveShotToScene(MoveShotToSceneArgs),
+    #[command(about = "Reorder a shot within its scene")]
+    ReorderShot(ReorderShotArgs),
+    #[command(about = "Attach a source reference to a shot or take")]
+    AddRef(RefArgs),
+    #[command(about = "Detach a source reference from a shot or take")]
+    RemoveRef(RefArgs),
     #[command(about = "Choose a shot's take")]
     SelectTake(SelectTakeArgs),
     #[command(about = "Set a clip's trim or fixed slot")]
@@ -76,6 +94,8 @@ pub enum Command {
     History(HistoryArgs),
     #[command(about = "Show the active sequence as a readable table")]
     Show(ShowArgs),
+    #[command(about = "Describe one panel and all of its layers")]
+    Describe(DescribeArgs),
     #[command(about = "Render one panel to PNG")]
     PanelImage(PanelImageArgs),
     #[command(about = "Render a sequence contact sheet to PNG")]
@@ -143,6 +163,22 @@ pub struct AddShotArgs {
     pub index: Option<usize>,
 }
 #[derive(Args, JsonSchema)]
+pub struct RemoveSceneArgs {
+    #[command(flatten)]
+    #[schemars(flatten)]
+    pub write: WriteArgs,
+    #[arg(long, help = "Scene id")]
+    pub scene: String,
+}
+#[derive(Args, JsonSchema)]
+pub struct RemoveShotArgs {
+    #[command(flatten)]
+    #[schemars(flatten)]
+    pub write: WriteArgs,
+    #[arg(long, help = "Shot id")]
+    pub shot: String,
+}
+#[derive(Args, JsonSchema)]
 pub struct AddPanelArgs {
     #[command(flatten)]
     #[schemars(flatten)]
@@ -159,6 +195,20 @@ pub struct AddPanelArgs {
     pub time: Option<f64>,
     #[arg(long, help = "Zero-based insertion index")]
     pub index: Option<usize>,
+}
+#[derive(Args, JsonSchema)]
+pub struct RemovePanelArgs {
+    #[command(flatten)]
+    #[schemars(flatten)]
+    pub write: WriteArgs,
+    #[arg(long, help = "Shot id")]
+    pub shot: Option<String>,
+    #[arg(long, help = "Take id")]
+    pub take: Option<String>,
+    #[arg(long, help = "Panel id")]
+    pub panel: Option<String>,
+    #[arg(long, help = "Sequence position, optionally followed by /PANEL")]
+    pub at: Option<String>,
 }
 #[derive(Args, JsonSchema)]
 pub struct AddTextArgs {
@@ -240,6 +290,22 @@ pub struct AddImageArgs {
         help = "Image fit: contain, cover, or fill"
     )]
     pub fit: String,
+}
+#[derive(Args, JsonSchema)]
+pub struct RemoveLayerArgs {
+    #[command(flatten)]
+    #[schemars(flatten)]
+    pub write: WriteArgs,
+    #[arg(long, help = "Shot id")]
+    pub shot: Option<String>,
+    #[arg(long, help = "Take id")]
+    pub take: Option<String>,
+    #[arg(long, help = "Panel id")]
+    pub panel: Option<String>,
+    #[arg(long, help = "Sequence position, optionally followed by /PANEL")]
+    pub at: Option<String>,
+    #[arg(long, help = "Layer id")]
+    pub layer: String,
 }
 #[derive(Args, JsonSchema)]
 pub struct ImportArgs {
@@ -340,6 +406,32 @@ pub struct RemoveClipArgs {
     pub clip: String,
 }
 #[derive(Args, JsonSchema)]
+pub struct ReorderClipArgs {
+    #[command(flatten)]
+    #[schemars(flatten)]
+    pub write: WriteArgs,
+    #[arg(long, help = "Owning cut id")]
+    pub cut: String,
+    #[arg(long, help = "Clip id")]
+    pub clip: String,
+    #[arg(long, help = "Zero-based destination index")]
+    pub index: usize,
+}
+#[derive(Args, JsonSchema)]
+pub struct SetActiveCutArgs {
+    #[command(flatten)]
+    #[schemars(flatten)]
+    pub write: WriteArgs,
+    #[arg(long, conflicts_with = "story", help = "Cut id to make active")]
+    pub cut: Option<String>,
+    #[arg(
+        long,
+        conflicts_with = "cut",
+        help = "Use story order instead of a cut"
+    )]
+    pub story: bool,
+}
+#[derive(Args, JsonSchema)]
 pub struct SetShotArgs {
     #[command(flatten)]
     #[schemars(flatten)]
@@ -362,7 +454,7 @@ pub struct SetShotArgs {
     pub duration: Option<f64>,
 }
 #[derive(Args, JsonSchema)]
-pub struct MoveShotArgs {
+pub struct MoveShotToSceneArgs {
     #[command(flatten)]
     #[schemars(flatten)]
     pub write: WriteArgs,
@@ -372,6 +464,31 @@ pub struct MoveShotArgs {
     pub scene: String,
     #[arg(long, help = "Zero-based destination index")]
     pub index: usize,
+}
+#[derive(Args, JsonSchema)]
+pub struct ReorderShotArgs {
+    #[command(flatten)]
+    #[schemars(flatten)]
+    pub write: WriteArgs,
+    #[arg(long, help = "Shot id")]
+    pub shot: String,
+    #[arg(long, help = "Zero-based destination index")]
+    pub index: usize,
+}
+#[derive(Args, JsonSchema)]
+pub struct RefArgs {
+    #[command(flatten)]
+    #[schemars(flatten)]
+    pub write: WriteArgs,
+    #[arg(long, help = "Shot id")]
+    pub shot: String,
+    #[arg(long, help = "Take id; omit to target the shot")]
+    pub take: Option<String>,
+    #[arg(
+        long,
+        help = "Path below sources/, with or without the sources/ prefix"
+    )]
+    pub reference: String,
 }
 #[derive(Args, JsonSchema)]
 pub struct SelectTakeArgs {
@@ -422,6 +539,19 @@ pub struct ShowArgs {
     pub dir: PathBuf,
     #[arg(long, help = "Cut id instead of the active sequence")]
     pub cut: Option<String>,
+}
+#[derive(Args, JsonSchema)]
+pub struct DescribeArgs {
+    #[arg(help = "Project folder")]
+    pub dir: PathBuf,
+    #[arg(long, help = "Shot id")]
+    pub shot: Option<String>,
+    #[arg(long, help = "Take id")]
+    pub take: Option<String>,
+    #[arg(long, help = "Panel id")]
+    pub panel: Option<String>,
+    #[arg(long, help = "Sequence position, optionally followed by /PANEL")]
+    pub at: Option<String>,
 }
 #[derive(Args, JsonSchema)]
 pub struct PanelImageArgs {
@@ -499,6 +629,8 @@ pub struct NotesArgs {
     pub resolved: bool,
     #[arg(long, help = "Only unresolved notes")]
     pub unresolved: bool,
+    #[arg(long, help = "Include both resolved and unresolved threads")]
+    pub all: bool,
 }
 #[derive(Args, JsonSchema)]
 pub struct SchemaArgs {

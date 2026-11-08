@@ -8,10 +8,13 @@ use std::{
 
 use serde_json::{Map, Value, json};
 use storyboard_core::{
-    AgentAuthor, Author, ClipSource, Format, Op, OpError, Pin, Project, RenderMode,
-    ValidationIssue, compile_active, compile_cut, render_cut_sheet, render_panel,
+    AgentAuthor, Author, ClipSource, Format, Op, OpError, Pin, Project, RefTarget, RenderMode,
+    Sticky, ValidationIssue, compile_active, compile_cut, describe_panel, render_cut_sheet,
+    render_panel,
 };
-use storyboard_store::{CommitError, StoreError, commit, create, history, open, undo};
+use storyboard_store::{
+    CommitError, StoreError, check_refs, commit, create, history, open, scan_sources, undo,
+};
 
 use crate::args::{CutSheetArgs, PanelImageArgs};
 
@@ -381,6 +384,125 @@ pub fn normalize_source_path(src: &str) -> Result<String, ApiError> {
     Ok(format!("sources/{stripped}"))
 }
 
+pub fn remove_scene_op(scene: String) -> Op {
+    Op::RemoveScene { scene }
+}
+
+pub fn remove_shot_op(shot: String) -> Op {
+    Op::RemoveShot { shot }
+}
+
+pub fn remove_panel_op(
+    dir: &Path,
+    shot: Option<String>,
+    take: Option<String>,
+    panel: Option<String>,
+    at: Option<&str>,
+) -> Result<Op, ApiError> {
+    let loaded = open(dir)?;
+    let (shot, take, panel) = target(&loaded.project, shot, take, panel, at)?;
+    Ok(Op::RemovePanel { shot, take, panel })
+}
+
+pub fn remove_layer_op(
+    dir: &Path,
+    shot: Option<String>,
+    take: Option<String>,
+    panel: Option<String>,
+    at: Option<&str>,
+    layer: String,
+) -> Result<Op, ApiError> {
+    let loaded = open(dir)?;
+    let (shot, take, panel) = target(&loaded.project, shot, take, panel, at)?;
+    Ok(Op::RemoveLayer {
+        shot,
+        take,
+        panel,
+        layer,
+    })
+}
+
+pub fn set_active_cut_op(cut: Option<String>, story: bool) -> Result<Op, ApiError> {
+    match (cut, story) {
+        (Some(cut), false) => Ok(Op::SetActiveCut { cut: Some(cut) }),
+        (None, true) => Ok(Op::SetActiveCut { cut: None }),
+        _ => Err(validation("provide --cut CUT or --story")),
+    }
+}
+
+pub fn reorder_clip_op(cut: String, clip: String, index: usize) -> Op {
+    Op::ReorderClip { cut, clip, index }
+}
+
+pub fn move_shot_to_scene_op(shot: String, scene: String, index: usize) -> Op {
+    Op::MoveShotBetweenScenes { shot, scene, index }
+}
+
+pub fn reorder_shot_op(shot: String, index: usize) -> Op {
+    Op::MoveShot { shot, index }
+}
+
+pub fn ref_op(
+    shot: String,
+    take: Option<String>,
+    reference: &str,
+    add: bool,
+) -> Result<Op, ApiError> {
+    let reference = normalize_source_path(reference)?;
+    let target = match take {
+        Some(take) => RefTarget::Take { shot, take },
+        None => RefTarget::Shot { shot },
+    };
+    Ok(if add {
+        Op::AddRef {
+            target,
+            reference,
+            index: None,
+        }
+    } else {
+        Op::RemoveRef { target, reference }
+    })
+}
+
+pub fn commit_add_ref(
+    dir: &Path,
+    base_version: &str,
+    shot: String,
+    take: Option<String>,
+    reference: &str,
+    author: Author,
+    note: Option<String>,
+) -> Result<Value, ApiError> {
+    let op = ref_op(shot, take, reference, true)?;
+    let mut result = commit_ops(dir, base_version, vec![op], author, note)?;
+    let loaded = open(dir)?;
+    let normalized = normalize_source_path(reference)?;
+    if let Some(missing) = check_refs(dir, &loaded.project)?
+        .iter()
+        .find(|missing| missing.path == normalized)
+    {
+        result
+            .as_object_mut()
+            .expect("write result is an object")
+            .insert(
+                "warning".into(),
+                Value::String(format!(
+                    "reference {} is missing for {}",
+                    missing.path, missing.target
+                )),
+            );
+    }
+    Ok(result)
+}
+
+pub fn sources_result(dir: &Path) -> Result<Value, ApiError> {
+    let loaded = open(dir)?;
+    Ok(json!({
+        "sources": scan_sources(dir)?,
+        "missing": check_refs(dir, &loaded.project)?,
+    }))
+}
+
 pub fn history_result(dir: &Path, limit: usize, full: bool) -> Result<Value, ApiError> {
     let records = history(dir, limit)?;
     if full {
@@ -399,9 +521,12 @@ pub fn notes_result(
     pin_value: Option<String>,
     resolved: bool,
     unresolved: bool,
+    all: bool,
 ) -> Result<Value, ApiError> {
-    if resolved && unresolved {
-        return Err(validation("resolved conflicts with unresolved"));
+    if usize::from(resolved) + usize::from(unresolved) + usize::from(all) > 1 {
+        return Err(validation(
+            "choose only one of resolved, unresolved, or all",
+        ));
     }
     if let Some(kind) = kind.as_deref()
         && !["note", "todo", "question"].contains(&kind)
@@ -414,10 +539,9 @@ pub fn notes_result(
     let loaded = open(dir)?;
     let author = author_value.map(|value| author(Some(value))).transpose()?;
     let pin = pin_value.map(|value| parse_pin(&value)).transpose()?;
-    let notes: Vec<_> = loaded
-        .project
-        .stickies
-        .into_iter()
+    let stickies = loaded.project.stickies;
+    let notes: Vec<_> = stickies
+        .iter()
         .filter(|sticky| sticky.reply_to.is_none())
         .filter(|sticky| kind.as_deref().is_none_or(|kind| sticky.kind == kind))
         .filter(|sticky| {
@@ -427,9 +551,27 @@ pub fn notes_result(
         })
         .filter(|sticky| pin.as_ref().is_none_or(|pin| sticky.pin == *pin))
         .filter(|sticky| !resolved || sticky.resolved)
-        .filter(|sticky| !unresolved || !sticky.resolved)
+        .filter(|sticky| all || resolved || !sticky.resolved)
+        .map(|sticky| sticky_thread_value(sticky, &stickies))
         .collect();
     Ok(json!({"version": loaded.version, "notes": notes}))
+}
+
+fn sticky_thread_value(sticky: &Sticky, stickies: &[Sticky]) -> Value {
+    let mut value = serde_json::to_value(sticky).expect("sticky serializes");
+    let object = value.as_object_mut().expect("sticky is an object");
+    object.insert("resolved".into(), Value::Bool(sticky.resolved));
+    object.insert(
+        "replies".into(),
+        Value::Array(
+            stickies
+                .iter()
+                .filter(|reply| reply.reply_to.as_deref() == Some(sticky.id.as_str()))
+                .map(|reply| sticky_thread_value(reply, stickies))
+                .collect(),
+        ),
+    );
+    value
 }
 
 fn fields<const N: usize>(values: [(&str, Value); N]) -> Map<String, Value> {
@@ -566,14 +708,90 @@ pub fn show(dir: &Path, cut: Option<&str>) -> Result<Value, ApiError> {
         json!({"position": index + 1, "start": item.start, "end": item.end, "shot": item.shot, "take": item.take, "title": shot.map(|shot| shot.title.clone()).unwrap_or_default(), "duration": shot.map(|shot| shot.duration).unwrap_or_default(), "offset": item.offset, "clip": item.clip})
     }).collect();
     let scenes: Vec<_> = loaded.project.scenes.iter().map(|scene| json!({"id": scene.id, "title": scene.title, "shots": scene.shots.iter().map(|shot| json!({"id": shot.id, "title": shot.title, "duration": shot.duration, "action": shot.action, "dialogue": shot.dialogue, "notes": shot.notes, "selected_take": shot.selected_take, "takes": shot.takes.iter().map(|take| json!({"id": take.id, "name": take.name, "panels": take.panels.len()})).collect::<Vec<_>>() })).collect::<Vec<_>>() })).collect();
-    let warnings: Vec<_> = sequence
+    let mut warnings: Vec<_> = sequence
         .warnings
         .iter()
         .map(|warning| json!({"field": warning.field, "message": warning.message}))
         .collect();
+    warnings.extend(
+        check_refs(dir, &loaded.project)?
+            .into_iter()
+            .map(|missing| {
+                json!({
+                    "field": missing.target,
+                    "message": format!("missing reference {}", missing.path),
+                })
+            }),
+    );
     Ok(
         json!({"version": loaded.version, "cut": cut, "frames": sequence.frames, "scenes": scenes, "shots": shots, "stickies": loaded.project.stickies, "positions": loaded.project.layout.positions, "warnings": warnings}),
     )
+}
+
+pub fn describe(
+    dir: &Path,
+    shot: Option<String>,
+    take: Option<String>,
+    panel: Option<String>,
+    at: Option<&str>,
+) -> Result<Value, ApiError> {
+    let loaded = open(dir)?;
+    let (shot_id, take_id, panel_id) = target(&loaded.project, shot, take, panel, at)?;
+    let description = describe_panel(&loaded.project, &shot_id, &take_id, &panel_id)
+        .map_err(|error| validation(error.to_string()))?;
+    let shot = loaded
+        .project
+        .scenes
+        .iter()
+        .flat_map(|scene| &scene.shots)
+        .find(|shot| shot.id == shot_id)
+        .expect("resolved shot exists");
+    let take = shot
+        .takes
+        .iter()
+        .find(|take| take.id == take_id)
+        .expect("resolved take exists");
+    let panel = take
+        .panels
+        .iter()
+        .find(|panel| panel.id == panel_id)
+        .expect("resolved panel exists");
+    let layers = panel
+        .layers
+        .iter()
+        .map(|layer| {
+            json!({
+                "id": layer.id,
+                "kind": layer.layer_type,
+                "geometry": {
+                    "x": layer.x,
+                    "y": layer.y,
+                    "width": layer.width,
+                    "height": layer.height,
+                },
+                "text": layer.text,
+                "label": layer.label,
+                "hidden": layer.hidden,
+                "opacity": layer.opacity,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "version": loaded.version,
+        "shot": shot_id,
+        "take": take_id,
+        "panel": panel_id,
+        "description": description,
+        "timing": {
+            "panel_time": panel.time,
+            "shot_duration": shot.duration,
+            "fps": loaded.project.fps,
+        },
+        "notes": shot.notes,
+        "direction": panel.direction,
+        "layers": layers,
+        "strokes": panel.strokes.len(),
+    }))
 }
 
 pub fn panel_image(args: PanelImageArgs) -> Result<Value, ApiError> {
@@ -686,7 +904,9 @@ pub fn schema(op: Option<&str>) -> Result<Value, ApiError> {
             })
             .cloned()
             .ok_or_else(|| options("unknown operation", op_names()))?;
-        return Ok(json!({"op": shape}));
+        return Ok(
+            json!({"op": shape, "$defs": schema.get("$defs").cloned().unwrap_or_else(|| json!({}))}),
+        );
     }
     let common = serde_json::to_value(schemars::schema_for!(storyboard_core::Layer))
         .map_err(|error| validation(error.to_string()))?;
@@ -774,6 +994,10 @@ pub fn pretty_show(value: &Value) -> String {
             shot["take"].as_str().unwrap_or("take"),
             shot["start"].as_u64().unwrap_or_default(),
             shot["end"].as_u64().unwrap_or_default(),
+        ));
+        output.push_str(&format!(
+            "    inspect: describe --at {}\n",
+            shot["position"].as_u64().unwrap_or_default()
         ));
     }
     output.push_str("STICKIES\n");
@@ -1270,6 +1494,13 @@ pub fn map_error(error: ApiError) -> Value {
             "correct every reported field".into(),
             Vec::new(),
             validation_values(issues),
+        ),
+        ApiError::Store(StoreError::SourceCollision(path)) => (
+            "store",
+            format!("source destination already exists: {}", path.display()),
+            "choose another name; replacing an existing source is not supported".into(),
+            Vec::new(),
+            Vec::new(),
         ),
         ApiError::Store(error) => (
             "store",

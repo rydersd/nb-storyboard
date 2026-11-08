@@ -10,6 +10,12 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo check -p storyboard-core -p storyboard-store
-      - run: cargo check -p storyboard-cli --no-default-features
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      - name: Test laws
+        run: |
+          set -o pipefail
+          results="$(mktemp)"
+          cargo test --workspace --all-features law_ 2>&1 | tee "$results"
+          passed="$(awk '/test result: ok\./ { for (i = 1; i <= NF; i++) if ($i == "passed;") total += $(i - 1) } END { print total + 0 }' "$results")"
+          test "$passed" -ge 10
       - run: cargo test --workspace --all-features

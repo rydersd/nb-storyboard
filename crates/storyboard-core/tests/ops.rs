@@ -686,6 +686,83 @@ fn op_patch_rejects_unknown_field_with_field_and_options() {
 }
 
 #[test]
+fn op_patch_reports_unknown_field_with_invalid_known_field() {
+    let mut project = fixture();
+    let error = apply(
+        &mut project,
+        &Op::UpdateShot {
+            shot: "shot-1".into(),
+            patch: patch([("bogus", json!(true)), ("status", json!("not-a-status"))]),
+        },
+    )
+    .expect_err("both patch issues must be reported");
+    assert!(
+        error
+            .issues
+            .iter()
+            .any(|issue| issue.field == "patch.bogus")
+    );
+    assert!(
+        error.issues.iter().any(|issue| {
+            issue.field == "patch.status" || issue.message.contains("not-a-status")
+        })
+    );
+}
+
+#[test]
+fn op_reply_reopens_resolved_thread() {
+    let mut project = fixture();
+    let author = Author::Human;
+    apply(
+        &mut project,
+        &Op::AddSticky {
+            id: Some("thread".into()),
+            text: "Question".into(),
+            kind: "question".into(),
+            author: author.clone(),
+            pin: Pin::None,
+            created: "2026-11-07T00:00:00Z".into(),
+        },
+    )
+    .expect("add thread");
+    apply(
+        &mut project,
+        &Op::ResolveSticky {
+            sticky: "thread".into(),
+        },
+    )
+    .expect("resolve thread");
+    apply(
+        &mut project,
+        &Op::ReplySticky {
+            sticky: "thread".into(),
+            id: Some("reply".into()),
+            text: "New information".into(),
+            kind: "note".into(),
+            author,
+            created: "2026-11-07T00:00:01Z".into(),
+        },
+    )
+    .expect("reply reopens thread");
+    assert!(
+        !project
+            .stickies
+            .iter()
+            .find(|item| item.id == "thread")
+            .unwrap()
+            .resolved
+    );
+    assert!(
+        !project
+            .stickies
+            .iter()
+            .find(|item| item.id == "reply")
+            .unwrap()
+            .resolved
+    );
+}
+
+#[test]
 fn op_errors_always_name_fields_and_valid_options_when_choices_exist() {
     let mut project = fixture();
     let errors = [

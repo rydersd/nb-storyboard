@@ -64,7 +64,7 @@ fn mcp_every_tool_schema_matches_its_cli_arguments() {
                 .any(|argument| argument.get_id().as_str() == "author");
         for argument in command.get_arguments() {
             let id = argument.get_id().as_str();
-            if id == "author" || id == "pretty" {
+            if (id == "author" && is_write) || id == "pretty" {
                 continue;
             }
             let name = if id == "dir" { "project" } else { id };
@@ -194,6 +194,28 @@ fn mcp_panel_image_returns_image_block_and_refuses_project_json_output() {
 }
 
 #[test]
+fn mcp_panel_image_accepts_integer_at() {
+    let (workspace, project, version) = create_project();
+    let mut mcp = Mcp::start(workspace.path(), "Codex");
+    let scene = result(&mcp.tool(
+        "add_scene",
+        json!({"project": project, "base_version": version, "title": "Opening"}),
+    ));
+    let _shot = result(&mcp.tool(
+        "add_shot",
+        json!({"project": project, "base_version": scene["version"], "scene": "scene-1", "title": "Arrival"}),
+    ));
+    let rendered = mcp.tool(
+        "panel_image",
+        json!({"project": project, "at": 1, "width": 64, "mode": "stage"}),
+    );
+    assert_eq!(
+        rendered.pointer("/result/content/0/type"),
+        Some(&json!("image"))
+    );
+}
+
+#[test]
 fn mcp_writes_are_compact_and_default_author_from_client() {
     let (workspace, project, version) = create_project();
     let mut mcp = Mcp::start(workspace.path(), "Codex");
@@ -218,7 +240,7 @@ fn mcp_writes_are_compact_and_default_author_from_client() {
 fn mcp_layer_schema_is_exposed_and_errors_have_contract_fields() {
     let (workspace, project, _version) = create_project();
     let mut mcp = Mcp::start(workspace.path(), "Codex");
-    let schema = result(&mcp.tool("schema", json!({"project": project})));
+    let schema = result(&mcp.tool("schema", json!({})));
     assert_eq!(schema["layers"]["image"]["required"], json!(["src"]));
     assert_eq!(
         schema["layers"]["text"]["required"],
@@ -517,4 +539,216 @@ fn mcp_forged_sticky_author_is_refused() {
             .expect("message")
             .contains("own author")
     );
+}
+
+#[test]
+fn mcp_describe_reads_panel_layers() {
+    let (workspace, project, version) = create_project();
+    let mut mcp = Mcp::start(workspace.path(), "Codex");
+    let scene = result(&mcp.tool(
+        "add_scene",
+        json!({"project": project, "base_version": version, "title": "Opening"}),
+    ));
+    let shot = result(&mcp.tool("add_shot", json!({"project": project, "base_version": scene["version"], "scene": "scene-1", "title": "Arrival"})));
+    result(&mcp.tool(
+        "add_text",
+        json!({"project": project, "base_version": shot["version"], "at": 1, "text": "Door"}),
+    ));
+    let described = result(&mcp.tool("describe", json!({"project": project, "at": 1})));
+    assert_eq!(described["layers"][0]["id"], "layer-1");
+    assert_eq!(described["layers"][0]["text"], "Door");
+}
+
+#[test]
+fn mcp_surface_verbs_execute_without_raw_ops() {
+    let (workspace, project, mut version) = create_project();
+    let mut mcp = Mcp::start(workspace.path(), "Codex");
+    let mut call = |name: &str, mut arguments: serde_json::Map<String, Value>| {
+        arguments.insert("project".into(), json!(project));
+        arguments.insert("base_version".into(), json!(version));
+        let value = result(&mcp.tool(name, Value::Object(arguments)));
+        version = value["version"].as_str().unwrap().to_owned();
+    };
+    call(
+        "add_scene",
+        json!({"title":"One"}).as_object().unwrap().clone(),
+    );
+    call(
+        "add_scene",
+        json!({"title":"Two"}).as_object().unwrap().clone(),
+    );
+    call(
+        "add_shot",
+        json!({"scene":"scene-1","title":"A"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    call(
+        "add_shot",
+        json!({"scene":"scene-1","title":"B"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    call(
+        "add_text",
+        json!({"at":1,"text":"Door"}).as_object().unwrap().clone(),
+    );
+    call(
+        "reorder_shot",
+        json!({"shot":"shot-2","index":0})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    call(
+        "move_shot_to_scene",
+        json!({"shot":"shot-2","scene":"scene-2","index":0})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    call(
+        "add_ref",
+        json!({"shot":"shot-1","reference":"sources/gone.png"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    call(
+        "remove_ref",
+        json!({"shot":"shot-1","reference":"sources/gone.png"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    call(
+        "add_cut",
+        json!({"name":"Alt"}).as_object().unwrap().clone(),
+    );
+    call(
+        "set_active_cut",
+        json!({"cut":"cut-1"}).as_object().unwrap().clone(),
+    );
+    call(
+        "add_clip",
+        json!({"cut":"cut-1","shot":"shot-1"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    call(
+        "add_clip",
+        json!({"cut":"cut-1","shot":"shot-2"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    call(
+        "reorder_clip",
+        json!({"cut":"cut-1","clip":"clip-2","index":0})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    call(
+        "remove_clip",
+        json!({"cut":"cut-1","clip":"clip-1"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    call(
+        "remove_layer",
+        json!({"shot":"shot-1","take":"take-1","panel":"panel-1","layer":"layer-1"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    call(
+        "remove_panel",
+        json!({"shot":"shot-1","take":"take-1","panel":"panel-1"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    call(
+        "remove_shot",
+        json!({"shot":"shot-1"}).as_object().unwrap().clone(),
+    );
+    call(
+        "remove_scene",
+        json!({"scene":"scene-1"}).as_object().unwrap().clone(),
+    );
+}
+
+#[test]
+fn mcp_rejects_unknown_arguments_and_every_at_accepts_integer() {
+    let (workspace, project, version) = create_project();
+    let mut mcp = Mcp::start(workspace.path(), "Codex");
+    let rejected = error(&mcp.tool("show", json!({"project": project, "surprise": true})));
+    assert_eq!(rejected["error"]["kind"], "validation");
+    let forged = error(&mcp.tool(
+        "add_scene",
+        json!({"project": project, "base_version": version, "title": "Opening", "author": "human"}),
+    ));
+    assert_eq!(forged["error"]["kind"], "validation");
+
+    let scene = result(&mcp.tool(
+        "add_scene",
+        json!({"project": project, "base_version": version, "title": "Opening"}),
+    ));
+    let shot = result(&mcp.tool("add_shot", json!({"project": project, "base_version": scene["version"], "scene": "scene-1", "title": "Arrival"})));
+    let text = result(&mcp.tool(
+        "add_text",
+        json!({"project": project, "base_version": shot["version"], "at": 1, "text": "Door"}),
+    ));
+    assert!(text["version"].is_string());
+}
+
+#[test]
+fn mcp_notes_schema_advertises_author_and_empty_render_warns() {
+    let (workspace, project, version) = create_project();
+    let mut mcp = Mcp::start(workspace.path(), "Codex");
+    let listed = mcp.request("tools/list", json!({}));
+    let notes = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "notes")
+        .unwrap();
+    assert!(notes["inputSchema"]["properties"]["author"].is_object());
+    let scene = result(&mcp.tool(
+        "add_scene",
+        json!({"project": project, "base_version": version, "title": "Opening"}),
+    ));
+    result(&mcp.tool("add_shot", json!({"project": project, "base_version": scene["version"], "scene": "scene-1", "title": "Arrival"})));
+    let response = mcp.tool(
+        "panel_image",
+        json!({"project": project, "at": 1, "width": 64}),
+    );
+    let rendered: Value = serde_json::from_str(
+        response
+            .pointer("/result/content/1/text")
+            .and_then(Value::as_str)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        rendered["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["message"] == "panel is empty; placeholder drawn")
+    );
+}
+
+#[test]
+fn mcp_malformed_json_line_gets_parse_error() {
+    let (workspace, _project, _version) = create_project();
+    let mut mcp = Mcp::start(workspace.path(), "Codex");
+    let response = mcp.raw_line("{not json");
+    assert_eq!(response["error"]["code"], -32700);
+    assert_eq!(response["id"], Value::Null);
 }

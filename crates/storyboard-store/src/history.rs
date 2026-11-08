@@ -64,16 +64,16 @@ pub(crate) fn records_since_from(
     records: &[CommitRecord],
     version: &str,
 ) -> Option<Vec<CommitRecord>> {
+    if let Some(index) = records.iter().rposition(|record| record.version == version) {
+        return Some(records[index + 1..].to_vec());
+    }
     if records
         .first()
         .is_some_and(|record| record.parent == version)
     {
         return Some(records.to_vec());
     }
-    records
-        .iter()
-        .position(|record| record.version == version)
-        .map(|index| records[index + 1..].to_vec())
+    None
 }
 
 pub(crate) fn read_records(dir: &Path) -> Result<Vec<CommitRecord>, StoreError> {

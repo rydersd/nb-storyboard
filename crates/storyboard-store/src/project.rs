@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use storyboard_core::{
-    AgentAuthor, Author, Format, Layout, Op, OpError, Project, ValidationIssue, apply,
-    footprint::disjoint, validate,
+    Author, Format, Layout, Op, OpError, Project, ValidationIssue, apply, footprint::disjoint,
+    validate,
 };
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -36,6 +36,8 @@ pub enum StoreError {
     InvalidJson { path: PathBuf, message: String },
     #[error("invalid project: {0:?}")]
     Invalid(Vec<ValidationIssue>),
+    #[error("source destination already exists: {0}")]
+    SourceCollision(PathBuf),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -44,6 +46,8 @@ pub enum StoreError {
 pub enum CommitError {
     #[error("empty commit")]
     EmptyCommit,
+    #[error("dishonest sticky authorship: {message}")]
+    Authorship { message: String },
     #[error("commit conflict: {reason}")]
     Conflict {
         current_version: String,
@@ -70,17 +74,6 @@ pub fn open(dir: &Path) -> Result<Loaded, StoreError> {
 }
 
 pub fn create(dir: &Path, title: &str, fps: u32, format: Format) -> Result<Loaded, StoreError> {
-    fs::create_dir_all(dir)?;
-    let _lock = ProjectLock::acquire(dir)?;
-    let path = project_path(dir);
-    if path.exists() {
-        return Err(StoreError::Io(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "project already exists",
-        )));
-    }
-    ensure_project_directories(dir)?;
-    write_gitignore(dir)?;
     let project = Project {
         schema: "nb-storyboard/v1".into(),
         title: title.into(),
@@ -100,13 +93,45 @@ pub fn create(dir: &Path, title: &str, fps: u32, format: Format) -> Result<Loade
     if !issues.is_empty() {
         return Err(StoreError::Invalid(issues));
     }
-    let bytes = serialize_project(&project)?;
-    write_atomic(dir, &bytes)?;
-    Ok(Loaded {
-        project,
-        version: version_of(&bytes),
-        dir: dir.to_path_buf(),
-    })
+    let dir_existed = dir.exists();
+    let tracked = ["sources", "history", ".cache", ".gitignore"]
+        .map(|name| (dir.join(name), dir.join(name).exists()));
+    let result = (|| {
+        fs::create_dir_all(dir)?;
+        let _lock = ProjectLock::acquire(dir)?;
+        let path = project_path(dir);
+        if path.exists() {
+            return Err(StoreError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "project already exists",
+            )));
+        }
+        ensure_project_directories(dir)?;
+        write_gitignore(dir)?;
+        let bytes = serialize_project(&project)?;
+        write_atomic(dir, &bytes)?;
+        Ok(Loaded {
+            project,
+            version: version_of(&bytes),
+            dir: dir.to_path_buf(),
+        })
+    })();
+    if result.is_err() {
+        if !dir_existed {
+            let _ = fs::remove_dir_all(dir);
+        } else {
+            for (path, existed) in tracked.into_iter().rev() {
+                if !existed {
+                    let _ = if path.is_dir() {
+                        fs::remove_dir(&path)
+                    } else {
+                        fs::remove_file(&path)
+                    };
+                }
+            }
+        }
+    }
+    result
 }
 
 pub fn commit(
@@ -118,6 +143,19 @@ pub fn commit(
 ) -> Result<CommitRecord, CommitError> {
     if ops.is_empty() {
         return Err(CommitError::EmptyCommit);
+    }
+    for op in &ops {
+        op.check_public()?;
+    }
+    if matches!(author, Author::Agent { .. })
+        && ops
+            .iter()
+            .flat_map(Op::sticky_authors)
+            .any(|sticky_author| sticky_author != &author)
+    {
+        return Err(CommitError::Authorship {
+            message: "an agent may only land stickies under its own author".into(),
+        });
     }
     let _lock = ProjectLock::acquire(dir).map_err(StoreError::from)?;
     repair_log_tail_for_dir(dir).map_err(CommitError::Store)?;
@@ -139,13 +177,31 @@ fn commit_locked(
     let records = synchronize_external_edit(dir, &project, &old_bytes, &current_version)
         .map_err(CommitError::Store)?;
 
+    let stale = base_version != current_version;
     // Applying before the rebase decision deliberately surfaces a real bad op before a stale-base conflict.
     let mut candidate = project.clone();
     let mut inverses = Vec::new();
     let mut ours = Vec::new();
     let mut created = Vec::new();
     for op in &ops {
-        let applied = apply(&mut candidate, op).map_err(CommitError::Op)?;
+        let applied = match apply(&mut candidate, op) {
+            Ok(applied) => applied,
+            Err(error) => {
+                if stale && ops_apply_to_version(dir, base_version, &ops) {
+                    let intervening = records_since_from(&records, base_version)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(CommitSummary::from)
+                        .collect();
+                    return Err(CommitError::Conflict {
+                        current_version,
+                        reason: "operation was valid at its base but cannot rebase onto the current project".into(),
+                        intervening,
+                    });
+                }
+                return Err(CommitError::Op(error));
+            }
+        };
         created.extend(applied.created_ids);
         inverses.splice(0..0, applied.inverse);
         ours.extend(applied.footprints);
@@ -156,7 +212,6 @@ fn commit_locked(
     let append_only_scenes = ops
         .iter()
         .all(|op| matches!(op, Op::AddScene { index: None, .. }));
-    let stale = base_version != current_version;
     let intervening = if stale {
         let Some(records) = records_since_from(&records, base_version) else {
             return Err(CommitError::Conflict {
@@ -200,7 +255,7 @@ fn commit_locked(
     let bytes = serialize_project(&candidate).map_err(CommitError::Store)?;
     let summary = note
         .clone()
-        .unwrap_or_else(|| summary_for(&ops, &intervening));
+        .unwrap_or_else(|| summary_for(&ops, &intervening, &project));
     let record = CommitRecord {
         version: version_of(&bytes),
         parent: current_version,
@@ -230,7 +285,7 @@ fn commit_locked(
 
 pub fn undo(
     dir: &Path,
-    _base_version: &str,
+    base_version: &str,
     author: Author,
     steps: usize,
 ) -> Result<CommitRecord, CommitError> {
@@ -244,6 +299,18 @@ pub fn undo(
     let mut current_version = version_of(&project_bytes);
     let records = synchronize_external_edit(dir, &project, &project_bytes, &current_version)
         .map_err(CommitError::Store)?;
+    if base_version != current_version {
+        let intervening = records_since_from(&records, base_version)
+            .unwrap_or_default()
+            .iter()
+            .map(CommitSummary::from)
+            .collect();
+        return Err(CommitError::Conflict {
+            current_version,
+            reason: "undo base version is stale".into(),
+            intervening,
+        });
+    }
     let already_undone: BTreeSet<_> = records
         .iter()
         .filter_map(|record| record.undoes.clone())
@@ -347,7 +414,7 @@ fn synchronize_external_edit(
         version: current_version.into(),
         parent: last.version.clone(),
         at: now(),
-        author: recovered_author(),
+        author: Author::Human,
         ops: Vec::new(),
         inverses: Vec::new(),
         footprints,
@@ -628,30 +695,34 @@ fn now() -> String {
         .expect("UTC timestamps format as RFC 3339")
 }
 
-fn recovered_author() -> Author {
-    Author::Agent {
-        agent: AgentAuthor {
-            name: "recovered".into(),
-            extra: Map::new(),
-        },
-        extra: Map::new(),
-    }
-}
-fn summary_for(ops: &[Op], intervening: &[CommitRecord]) -> String {
+fn summary_for(ops: &[Op], intervening: &[CommitRecord], before: &Project) -> String {
+    let resolved = |sticky: &str| {
+        before
+            .stickies
+            .iter()
+            .any(|note| note.id == sticky && note.resolved)
+    };
     let prefix = if intervening.is_empty() {
         ""
     } else {
         "rebased "
     };
-    let detail = ops.iter().map(op_summary).collect::<Vec<_>>().join("; ");
+    let detail = ops
+        .iter()
+        .map(|op| op_summary(op, &resolved))
+        .collect::<Vec<_>>()
+        .join("; ");
     format!("{prefix}{detail}")
 }
 
-fn op_summary(op: &Op) -> String {
+fn op_summary(op: &Op, resolved: &dyn Fn(&str) -> bool) -> String {
     match op {
         Op::Batch { ops } => format!(
             "batch ({})",
-            ops.iter().map(op_summary).collect::<Vec<_>>().join("; ")
+            ops.iter()
+                .map(|op| op_summary(op, resolved))
+                .collect::<Vec<_>>()
+                .join("; ")
         ),
         Op::AddScene { .. } => "add-scene".into(),
         Op::RemoveScene { scene } => format!("remove-scene {scene}"),
@@ -659,7 +730,7 @@ fn op_summary(op: &Op) -> String {
         Op::UpdateScene { scene, .. } => format!("update-scene {scene}"),
         Op::AddShot { scene, .. } => format!("add-shot to {scene}"),
         Op::RemoveShot { shot } => format!("remove-shot {shot}"),
-        Op::MoveShot { shot, index } => format!("move-shot {shot} to {index}"),
+        Op::MoveShot { shot, index } => format!("reorder-shot {shot} to {index}"),
         Op::UpdateShot { shot, .. } => format!("update-shot {shot}"),
         Op::AddTake { shot, .. } => format!("add-take to {shot}"),
         Op::RemoveTake { shot, take } => format!("remove-take {shot}/{take}"),
@@ -731,13 +802,18 @@ fn op_summary(op: &Op) -> String {
             None => "clear-active-cut".into(),
         },
         Op::MoveShotBetweenScenes { shot, scene, index } => {
-            format!("move-shot {shot} to {scene} at {index}")
+            format!("move-shot-to-scene {shot} to {scene} at {index}")
         }
         Op::AddRef {
             target, reference, ..
-        } => format!("add-ref {reference} to {target:?}"),
-        Op::RemoveRef { target, reference } => format!("remove-ref {reference} from {target:?}"),
+        } => format!("add-ref {reference} to {}", ref_target_summary(target)),
+        Op::RemoveRef { target, reference } => {
+            format!("remove-ref {reference} from {}", ref_target_summary(target))
+        }
         Op::ResolveSticky { sticky } => format!("resolve {sticky}"),
+        Op::ReplySticky { sticky, .. } if resolved(sticky) => {
+            format!("reply to {sticky}; reopen thread")
+        }
         Op::ReplySticky { sticky, .. } => format!("reply to {sticky}"),
         Op::MoveNode { node, position } => match position {
             Some(_) => format!("move-node {node}"),
@@ -745,6 +821,24 @@ fn op_summary(op: &Op) -> String {
         },
         Op::RestoreChanges { .. } => "undo".into(),
     }
+}
+
+fn ref_target_summary(target: &storyboard_core::RefTarget) -> String {
+    match target {
+        storyboard_core::RefTarget::Shot { shot } => format!("shot {shot}"),
+        storyboard_core::RefTarget::Take { shot, take } => format!("take {shot}/{take}"),
+    }
+}
+
+fn ops_apply_to_version(dir: &Path, version: &str, ops: &[Op]) -> bool {
+    let path = dir.join("history").join(format!("archive-{version}.json"));
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(mut project) = serde_json::from_slice::<Project>(&bytes) else {
+        return false;
+    };
+    ops.iter().all(|op| apply(&mut project, op).is_ok())
 }
 
 fn expected_after_last_record(dir: &Path, record: &CommitRecord) -> Option<Project> {
@@ -919,4 +1013,41 @@ fn entity_order(value: Option<&Value>) -> Vec<&str> {
         .flatten()
         .filter_map(|item| item.get("id").and_then(Value::as_str))
         .collect()
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::op_summary;
+    use storyboard_core::{Author, Op};
+
+    #[test]
+    fn summaries_use_the_surface_names_and_do_not_claim_a_reopen() {
+        let reply = Op::ReplySticky {
+            sticky: "sticky-1".into(),
+            id: None,
+            text: "ok".into(),
+            kind: "comment".into(),
+            author: Author::Human,
+            created: "2026-11-07T00:00:00Z".into(),
+        };
+        assert_eq!(op_summary(&reply, &|_| false), "reply to sticky-1");
+        assert_eq!(
+            op_summary(&reply, &|sticky| sticky == "sticky-1"),
+            "reply to sticky-1; reopen thread"
+        );
+        let across = Op::MoveShotBetweenScenes {
+            shot: "shot-1".into(),
+            scene: "scene-2".into(),
+            index: 0,
+        };
+        assert_eq!(
+            op_summary(&across, &|_| false),
+            "move-shot-to-scene shot-1 to scene-2 at 0"
+        );
+        let within = Op::MoveShot {
+            shot: "shot-1".into(),
+            index: 2,
+        };
+        assert_eq!(op_summary(&within, &|_| false), "reorder-shot shot-1 to 2");
+    }
 }

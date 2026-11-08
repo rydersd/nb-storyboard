@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use storyboard_core::{Author, ClipSource, CutSource, Op, ShotSource};
-use storyboard_store::{import_source, scan_sources};
+use storyboard_store::import_source;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
@@ -21,13 +21,17 @@ use crate::{
 };
 
 const AGREEMENT: &str = "Read with show, notes, history, and schema before changing a project. Writes use the base_version returned by a read or write; send small edits and then read the result. Stickies are the shared note channel: use note, reply, and resolve; an agent can only create stickies under its own client identity.";
-const TOOLS: [(&str, &str); 30] = [
+const TOOLS: [(&str, &str); 40] = [
     ("new", "Create an empty storyboard project."),
     ("add_scene", "Add a scene to a project."),
     ("add_shot", "Add a shot with its first take and panel."),
+    ("remove_scene", "Remove a scene."),
+    ("remove_shot", "Remove a shot."),
     ("add_panel", "Add a panel to a take."),
+    ("remove_panel", "Remove a panel from a take."),
     ("add_text", "Add a text layer to a panel."),
     ("add_image", "Add an image layer to a panel."),
+    ("remove_layer", "Remove a layer from a panel."),
     ("import", "Copy a file into sources."),
     ("sources", "List scanned sources."),
     ("add_take", "Add a take to a shot."),
@@ -37,13 +41,25 @@ const TOOLS: [(&str, &str); 30] = [
     ("add_clip", "Add a shot or nested-cut clip."),
     ("update_clip", "Update a clip take."),
     ("remove_clip", "Remove a clip."),
+    ("reorder_clip", "Reorder a clip within a cut."),
+    ("set_active_cut", "Choose the active cut or story order."),
     ("set_shot", "Update shot story fields."),
-    ("move_shot", "Move a shot into a scene."),
+    ("move_shot_to_scene", "Move a shot into a scene."),
+    ("reorder_shot", "Reorder a shot within its scene."),
+    ("add_ref", "Attach a source reference to a shot or take."),
+    (
+        "remove_ref",
+        "Detach a source reference from a shot or take.",
+    ),
     ("select_take", "Choose a shot take."),
     ("trim", "Set a clip trim or slot."),
     ("undo", "Undo this author's recent commits."),
     ("history", "Read project history."),
     ("show", "Read the active sequence."),
+    (
+        "describe",
+        "Describe a panel, its layers, timing, and notes.",
+    ),
     ("panel_image", "Render one panel as an image."),
     ("cut_sheet", "Render a sequence contact sheet."),
     ("note", "Add a sticky note."),
@@ -74,9 +90,13 @@ fn input_schema(name: &str) -> Value {
         "new" => schema_for_args::<NewArgs>(name, false),
         "add_scene" => schema_for_args::<AddSceneArgs>(name, true),
         "add_shot" => schema_for_args::<AddShotArgs>(name, true),
+        "remove_scene" => schema_for_args::<RemoveSceneArgs>(name, true),
+        "remove_shot" => schema_for_args::<RemoveShotArgs>(name, true),
         "add_panel" => schema_for_args::<AddPanelArgs>(name, true),
+        "remove_panel" => schema_for_args::<RemovePanelArgs>(name, true),
         "add_text" => schema_for_args::<AddTextArgs>(name, true),
         "add_image" => schema_for_args::<AddImageArgs>(name, true),
+        "remove_layer" => schema_for_args::<RemoveLayerArgs>(name, true),
         "import" => schema_for_args::<ImportArgs>(name, false),
         "sources" => schema_for_args::<SourcesArgs>(name, false),
         "add_take" => schema_for_args::<AddTakeArgs>(name, true),
@@ -86,13 +106,18 @@ fn input_schema(name: &str) -> Value {
         "add_clip" => schema_for_args::<AddClipArgs>(name, true),
         "update_clip" => schema_for_args::<UpdateClipArgs>(name, true),
         "remove_clip" => schema_for_args::<RemoveClipArgs>(name, true),
+        "reorder_clip" => schema_for_args::<ReorderClipArgs>(name, true),
+        "set_active_cut" => schema_for_args::<SetActiveCutArgs>(name, true),
         "set_shot" => schema_for_args::<SetShotArgs>(name, true),
-        "move_shot" => schema_for_args::<MoveShotArgs>(name, true),
+        "move_shot_to_scene" => schema_for_args::<MoveShotToSceneArgs>(name, true),
+        "reorder_shot" => schema_for_args::<ReorderShotArgs>(name, true),
+        "add_ref" | "remove_ref" => schema_for_args::<RefArgs>(name, true),
         "select_take" => schema_for_args::<SelectTakeArgs>(name, true),
         "trim" => schema_for_args::<TrimArgs>(name, true),
         "undo" => schema_for_args::<UndoArgs>(name, true),
         "history" => schema_for_args::<HistoryArgs>(name, false),
         "show" => schema_for_args::<ShowArgs>(name, false),
+        "describe" => schema_for_args::<DescribeArgs>(name, false),
         "panel_image" => schema_for_args::<PanelImageArgs>(name, false),
         "cut_sheet" => schema_for_args::<CutSheetArgs>(name, false),
         "note" => schema_for_args::<NoteArgs>(name, true),
@@ -100,8 +125,15 @@ fn input_schema(name: &str) -> Value {
         "resolve" => schema_for_args::<ResolveArgs>(name, true),
         "notes" => schema_for_args::<NotesArgs>(name, false),
         "schema" => schema_for_args::<SchemaArgs>(name, false),
-        "apply" => serde_json::to_value(schemars::schema_for!(ApplyArgs))
-            .expect("ApplyArgs schema must serialize"),
+        "apply" => {
+            let mut schema = serde_json::to_value(schemars::schema_for!(ApplyArgs))
+                .expect("ApplyArgs schema must serialize");
+            schema
+                .as_object_mut()
+                .expect("apply schema is an object")
+                .insert("additionalProperties".into(), Value::Bool(false));
+            schema
+        }
         _ => unreachable!("tool list and schema dispatch must match"),
     }
 }
@@ -116,7 +148,21 @@ fn schema_for_args<T: JsonSchema>(name: &str, write: bool) -> Value {
     if let Some(project) = properties.remove("dir") {
         properties.insert("project".into(), project);
     }
-    properties.remove("author");
+    if write {
+        properties.remove("author");
+    }
+    if properties.contains_key("at") {
+        properties.insert(
+            "at".into(),
+            json!({
+                "description": "Sequence position, optionally followed by /PANEL.",
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "integer", "minimum": 1}
+                ]
+            }),
+        );
+    }
 
     let cli_name = name.replace('_', "-");
     let cli = Cli::command();
@@ -126,7 +172,7 @@ fn schema_for_args<T: JsonSchema>(name: &str, write: bool) -> Value {
     let mut required = Vec::new();
     for argument in command.get_arguments() {
         let id = argument.get_id().as_str();
-        if id == "author" || id == "pretty" {
+        if (id == "author" && write) || id == "pretty" {
             continue;
         }
         let property_name = if id == "dir" { "project" } else { id };
@@ -161,9 +207,21 @@ pub fn run(workspace: &Path) -> Result<(), ApiError> {
     let mut stdout = io::stdout().lock();
     let mut author = String::from("agent");
     for line in stdin.lock().lines() {
-        let request: Value = match line.map(|line| serde_json::from_str(&line).ok()) {
-            Ok(Some(request)) => request,
-            _ => continue,
+        let request: Value = match line {
+            Ok(line) => match serde_json::from_str(&line) {
+                Ok(request) => request,
+                Err(_) => {
+                    serde_json::to_writer(
+                        &mut stdout,
+                        &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}),
+                    )
+                    .map_err(|e| ops_api::validation(e.to_string()))?;
+                    writeln!(stdout).map_err(|e| ApiError::Store(e.into()))?;
+                    stdout.flush().map_err(|e| ApiError::Store(e.into()))?;
+                    continue;
+                }
+            },
+            Err(error) => return Err(ApiError::Store(error.into())),
         };
         let id = request.get("id").cloned();
         let method = request
@@ -225,15 +283,41 @@ pub fn run(workspace: &Path) -> Result<(), ApiError> {
 
 fn call(workspace: &Path, author: &str, params: Value) -> Result<Value, ApiError> {
     let name = required_value(&params, "name")?;
+    if !TOOLS.iter().any(|(candidate, _)| *candidate == name) {
+        return Err(ops_api::validation(format!("unknown tool {name}")));
+    }
     let input = params
         .get("arguments")
         .and_then(Value::as_object)
         .ok_or_else(|| ops_api::validation("tool arguments must be an object"))?;
+    validate_tool_arguments(name, input)?;
     match dispatch(workspace, author, name, input)? {
         Output::Text(value) => Ok(text(value, false)),
         Output::Image(value, bytes) => Ok(
             json!({"content":[{"type":"image","data":STANDARD.encode(bytes),"mimeType":"image/png"},{"type":"text","text":value.to_string()}]}),
         ),
+    }
+}
+
+fn validate_tool_arguments(name: &str, input: &Map<String, Value>) -> Result<(), ApiError> {
+    let schema = input_schema(name);
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ops_api::validation("tool schema has no properties"))?;
+    let unknown = input
+        .keys()
+        .filter(|key| !properties.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(ops_api::validation(format!(
+            "unknown argument{}: {}",
+            if unknown.len() == 1 { "" } else { "s" },
+            unknown.join(", ")
+        )))
     }
 }
 
@@ -286,16 +370,30 @@ fn dispatch(
                 index: opt_num(input, "index")?,
             },
         ),
+        "remove_scene" => write(
+            workspace,
+            input,
+            client,
+            ops_api::remove_scene_op(required(input, "scene")?.into()),
+        ),
+        "remove_shot" => write(
+            workspace,
+            input,
+            client,
+            ops_api::remove_shot_op(required(input, "shot")?.into()),
+        ),
         "add_panel" => add_panel(workspace, input, client),
+        "remove_panel" => remove_panel(workspace, input, client),
         "add_text" => add_layer(workspace, input, client, "text"),
         "add_image" => add_layer(workspace, input, client, "image"),
+        "remove_layer" => remove_layer(workspace, input, client),
         "import" => {
             let dir = project(workspace, input)?;
             Ok(
                 json!({"path":import_source(&dir,&path(input,"source")?,&PathBuf::from("sources").join(path(input,"destination")?))?}),
             )
         }
-        "sources" => Ok(json!({"sources":scan_sources(&project(workspace,input)?)?})),
+        "sources" => ops_api::sources_result(&project(workspace, input)?),
         "add_take" => write(
             workspace,
             input,
@@ -345,16 +443,58 @@ fn dispatch(
                 clip: required(input, "clip")?.into(),
             },
         ),
-        "set_shot" => set_shot(workspace, input, client),
-        "move_shot" => write(
+        "reorder_clip" => write(
             workspace,
             input,
             client,
-            Op::MoveShotBetweenScenes {
-                shot: required(input, "shot")?.into(),
-                scene: required(input, "scene")?.into(),
-                index: req_num(input, "index")?,
-            },
+            ops_api::reorder_clip_op(
+                required(input, "cut")?.into(),
+                required(input, "clip")?.into(),
+                req_num(input, "index")?,
+            ),
+        ),
+        "set_active_cut" => write(
+            workspace,
+            input,
+            client,
+            ops_api::set_active_cut_op(opt(input, "cut"), boolean(input, "story", false)?)?,
+        ),
+        "set_shot" => set_shot(workspace, input, client),
+        "move_shot_to_scene" => write(
+            workspace,
+            input,
+            client,
+            ops_api::move_shot_to_scene_op(
+                required(input, "shot")?.into(),
+                required(input, "scene")?.into(),
+                req_num(input, "index")?,
+            ),
+        ),
+        "reorder_shot" => write(
+            workspace,
+            input,
+            client,
+            ops_api::reorder_shot_op(required(input, "shot")?.into(), req_num(input, "index")?),
+        ),
+        "add_ref" => ops_api::commit_add_ref(
+            &project(workspace, input)?,
+            required(input, "base_version")?,
+            required(input, "shot")?.into(),
+            opt(input, "take"),
+            required(input, "reference")?,
+            agent(client)?,
+            opt(input, "note"),
+        ),
+        "remove_ref" => write(
+            workspace,
+            input,
+            client,
+            ops_api::ref_op(
+                required(input, "shot")?.into(),
+                opt(input, "take"),
+                required(input, "reference")?,
+                false,
+            )?,
         ),
         "select_take" => write(
             workspace,
@@ -381,6 +521,13 @@ fn dispatch(
             boolean(input, "full", false)?,
         ),
         "show" => ops_api::show(&project(workspace, input)?, opt_ref(input, "cut")),
+        "describe" => ops_api::describe(
+            &project(workspace, input)?,
+            opt(input, "shot"),
+            opt(input, "take"),
+            opt(input, "panel"),
+            at_value(input)?.as_deref(),
+        ),
         "panel_image" => {
             return render_panel(workspace, input)
                 .map(|(value, bytes)| Output::Image(value, bytes));
@@ -435,6 +582,7 @@ fn dispatch(
             opt(input, "pin"),
             boolean(input, "resolved", false)?,
             boolean(input, "unresolved", false)?,
+            boolean(input, "all", false)?,
         ),
         "schema" => ops_api::schema(opt_ref(input, "op")),
         "apply" => {
@@ -468,9 +616,13 @@ fn is_write_tool(name: &str) -> bool {
         name,
         "add_scene"
             | "add_shot"
+            | "remove_scene"
+            | "remove_shot"
             | "add_panel"
+            | "remove_panel"
             | "add_text"
             | "add_image"
+            | "remove_layer"
             | "add_take"
             | "add_cut"
             | "update_cut"
@@ -478,8 +630,13 @@ fn is_write_tool(name: &str) -> bool {
             | "add_clip"
             | "update_clip"
             | "remove_clip"
+            | "reorder_clip"
+            | "set_active_cut"
             | "set_shot"
-            | "move_shot"
+            | "move_shot_to_scene"
+            | "reorder_shot"
+            | "add_ref"
+            | "remove_ref"
             | "select_take"
             | "trim"
             | "undo"
@@ -514,10 +671,31 @@ fn add_panel(
         &dir,
         opt(input, "shot"),
         opt(input, "take"),
-        opt_ref(input, "at"),
+        at_value(input)?.as_deref(),
         opt(input, "id"),
         opt_num(input, "time")?,
         opt_num(input, "index")?,
+    )?;
+    ops_api::commit_ops(
+        &dir,
+        required(input, "base_version")?,
+        vec![op],
+        agent(client)?,
+        opt(input, "note"),
+    )
+}
+fn remove_panel(
+    workspace: &Path,
+    input: &Map<String, Value>,
+    client: &str,
+) -> Result<Value, ApiError> {
+    let dir = project(workspace, input)?;
+    let op = ops_api::remove_panel_op(
+        &dir,
+        opt(input, "shot"),
+        opt(input, "take"),
+        opt(input, "panel"),
+        at_value(input)?.as_deref(),
     )?;
     ops_api::commit_ops(
         &dir,
@@ -540,7 +718,7 @@ fn add_layer(
             opt(input, "shot"),
             opt(input, "take"),
             opt(input, "panel"),
-            opt_ref(input, "at"),
+            at_value(input)?.as_deref(),
             required(input, "text")?.into(),
             number(input, "x", 0.0)?,
             number(input, "y", 0.0)?,
@@ -555,7 +733,7 @@ fn add_layer(
             opt(input, "shot"),
             opt(input, "take"),
             opt(input, "panel"),
-            opt_ref(input, "at"),
+            at_value(input)?.as_deref(),
             required(input, "src")?,
             number(input, "x", 0.0)?,
             number(input, "y", 0.0)?,
@@ -564,6 +742,28 @@ fn add_layer(
             opt(input, "fit").unwrap_or_else(|| "contain".into()),
         )?
     };
+    ops_api::commit_ops(
+        &dir,
+        required(input, "base_version")?,
+        vec![op],
+        agent(client)?,
+        opt(input, "note"),
+    )
+}
+fn remove_layer(
+    workspace: &Path,
+    input: &Map<String, Value>,
+    client: &str,
+) -> Result<Value, ApiError> {
+    let dir = project(workspace, input)?;
+    let op = ops_api::remove_layer_op(
+        &dir,
+        opt(input, "shot"),
+        opt(input, "take"),
+        opt(input, "panel"),
+        at_value(input)?.as_deref(),
+        required(input, "layer")?.into(),
+    )?;
     ops_api::commit_ops(
         &dir,
         required(input, "base_version")?,
@@ -660,7 +860,7 @@ fn render_panel(
             shot: opt(input, "shot"),
             take: opt(input, "take"),
             panel: opt(input, "panel"),
-            at: opt(input, "at"),
+            at: at_value(input)?,
             width: number(input, "width", 960)?,
             mode: opt(input, "mode").unwrap_or_else(|| "stage".into()),
             out: opt(input, "out").map(PathBuf::from),
@@ -763,6 +963,18 @@ fn opt(input: &Map<String, Value>, name: &str) -> Option<String> {
 }
 fn opt_ref<'a>(input: &'a Map<String, Value>, name: &str) -> Option<&'a str> {
     input.get(name).and_then(Value::as_str)
+}
+fn at_value(input: &Map<String, Value>) -> Result<Option<String>, ApiError> {
+    input
+        .get("at")
+        .map(|value| match value {
+            Value::String(value) => Ok(value.clone()),
+            Value::Number(value) if value.as_u64().is_some() => Ok(value.to_string()),
+            _ => Err(ops_api::validation(
+                "at must be a string such as \"1\" or \"2/1\", or an integer such as 1",
+            )),
+        })
+        .transpose()
 }
 fn path(input: &Map<String, Value>, name: &str) -> Result<PathBuf, ApiError> {
     Ok(PathBuf::from(required(input, name)?))

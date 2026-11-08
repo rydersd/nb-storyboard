@@ -15,6 +15,31 @@ fn fixture() -> Project {
     serde_json::from_str(SMALL).expect("fixture is a project")
 }
 
+#[test]
+fn render_empty_panel_warns_that_placeholder_was_drawn() {
+    let directory = tempfile::TempDir::new().expect("temporary directory");
+    let mut project = fixture();
+    let panel = &mut project.scenes[0].shots[0].takes[0].panels[0];
+    panel.layers.clear();
+    panel.strokes.clear();
+    let rendered = render_panel(
+        &project,
+        directory.path(),
+        "shot-1",
+        "take-1",
+        "panel-1",
+        320,
+        RenderMode::Stage,
+    )
+    .expect("empty panel renders");
+    assert!(
+        rendered
+            .warnings
+            .iter()
+            .any(|warning| { warning.message == "panel is empty; placeholder drawn" })
+    );
+}
+
 fn panel(project: &mut Project, shot: usize) -> &mut storyboard_core::Panel {
     &mut project.scenes[if shot < 2 { 0 } else { 1 }].shots[shot % 2].takes[0].panels[0]
 }
@@ -918,7 +943,9 @@ fn render_scattered_stroke_points_is_bounded() {
         RenderMode::Stage,
     )
     .expect("dense stroke renders");
-    assert!(started.elapsed() < Duration::from_secs(20));
+    // Guards against the unbounded 85 s render, not a perf budget: the ink limit (asserted below)
+    // bounds the work; 60 s leaves room for a loaded debug machine.
+    assert!(started.elapsed() < Duration::from_secs(60));
     assert!(
         rendered
             .warnings

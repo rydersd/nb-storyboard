@@ -469,7 +469,31 @@ pub fn apply(project: &mut Project, op: &Op) -> Result<Applied, OpError> {
     let before = project.clone();
     let mut next = project.clone();
     let mut effect = Effect::default();
-    execute(&mut next, op, &mut effect)?;
+    if let Err(mut error) = execute(&mut next, op, &mut effect) {
+        if error
+            .issues
+            .iter()
+            .any(|issue| issue.message.starts_with("unknown patch field "))
+        {
+            let patch = submitted_patch(op);
+            error
+                .issues
+                .extend(validate(&next).into_iter().map(|issue| {
+                    let leaf = issue.field.rsplit('.').next().unwrap_or(&issue.field);
+                    let field = if patch.is_some_and(|patch| patch.contains_key(leaf)) {
+                        format!("patch.{leaf}")
+                    } else {
+                        issue.field
+                    };
+                    OpIssue {
+                        field,
+                        message: issue.message,
+                        valid: issue.valid,
+                    }
+                }));
+        }
+        return Err(error);
+    }
     if next == before {
         return Err(OpError::at("op", "operation made no change"));
     }
@@ -484,6 +508,20 @@ pub fn apply(project: &mut Project, op: &Op) -> Result<Applied, OpError> {
         unpinned_stickies: sorted(effect.unpinned),
         created_ids: sorted(effect.created),
     })
+}
+
+fn submitted_patch(op: &Op) -> Option<&Patch> {
+    match op {
+        Op::UpdateScene { patch, .. }
+        | Op::UpdateShot { patch, .. }
+        | Op::UpdateTake { patch, .. }
+        | Op::UpdatePanel { patch, .. }
+        | Op::UpdateLayer { patch, .. }
+        | Op::UpdateSticky { patch, .. }
+        | Op::UpdateClip { patch, .. }
+        | Op::UpdateCut { patch, .. } => Some(patch),
+        _ => None,
+    }
 }
 
 fn inverse_ops(before: &Project, after: &Project, op: &Op) -> Result<Vec<Op>, OpError> {
@@ -1439,7 +1477,15 @@ fn execute(project: &mut Project, op: &Op, effect: &mut Effect) -> Result<(), Op
             author,
             created,
         } => {
-            let _ = sticky_mut(project, sticky)?;
+            let thread = thread_ids(project, sticky)?;
+            for id in thread {
+                let item = sticky_mut(project, &id)?;
+                if item.resolved {
+                    item.resolved = false;
+                    effect.touch(format!("sticky/{id}"));
+                    effect.touch(format!("sticky/{id}/field/resolved"));
+                }
+            }
             effect.touch(format!("sticky/{sticky}"));
             let id = next_id(project, "sticky", id.as_deref())?;
             project.stickies.push(Sticky {
@@ -2565,17 +2611,41 @@ where
         .keys()
         .filter(|key| !valid.contains(&key.as_str()))
         .collect();
-    if !unknown.is_empty() {
-        let valid: Vec<_> = valid.iter().map(|field| (*field).to_owned()).collect();
-        let issues = unknown
-            .iter()
-            .map(|key| OpIssue {
-                field: format!("patch.{key}"),
-                message: format!("unknown patch field {key}"),
-                valid: valid.clone(),
-            })
-            .collect::<Vec<_>>();
-        let first = &issues[0];
+    let valid_values: Vec<_> = valid.iter().map(|field| (*field).to_owned()).collect();
+    let mut issues = unknown
+        .iter()
+        .map(|key| OpIssue {
+            field: format!("patch.{key}"),
+            message: format!("unknown patch field {key}"),
+            valid: valid_values.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut value =
+        serde_json::to_value(&*target).map_err(|error| OpError::at("patch", error.to_string()))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| OpError::at("patch", "patch target is not an object"))?;
+    for (key, value) in patch {
+        if valid.contains(&key.as_str()) {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    let next = serde_json::from_value(value).map_err(|error| {
+        issues.push(OpIssue {
+            field: "patch".into(),
+            message: format!("invalid patch: {error}"),
+            valid: valid_values.clone(),
+        });
+        let first = issues.first().expect("invalid patch adds an issue");
+        OpError {
+            field: first.field.clone(),
+            message: first.message.clone(),
+            valid: first.valid.clone(),
+            issues: issues.clone(),
+        }
+    })?;
+    *target = next;
+    if let Some(first) = issues.first() {
         return Err(OpError {
             field: first.field.clone(),
             message: first.message.clone(),
@@ -2583,16 +2653,6 @@ where
             issues,
         });
     }
-    let mut value =
-        serde_json::to_value(&*target).map_err(|error| OpError::at("patch", error.to_string()))?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| OpError::at("patch", "patch target is not an object"))?;
-    for (key, value) in patch {
-        object.insert(key.clone(), value.clone());
-    }
-    *target = serde_json::from_value(value)
-        .map_err(|error| OpError::at("patch", format!("invalid patch: {error}")))?;
     Ok(())
 }
 

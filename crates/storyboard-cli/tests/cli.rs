@@ -7,6 +7,9 @@ use serde_json::Value;
 use storyboard_cli::args::Cli;
 use tempfile::TempDir;
 
+#[path = "support/fixture.rs"]
+mod fixture_support;
+
 fn storyboard() -> Command {
     Command::cargo_bin("storyboard").expect("storyboard binary")
 }
@@ -95,6 +98,121 @@ fn assert_refuses_without_overwrite(command: &mut Command, project: &Path) {
         fs::read(project).expect("read project after rejection"),
         before
     );
+}
+
+fn runnable_shell_blocks(readme: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = None;
+
+    for line in readme.lines() {
+        if line == "```sh runnable" {
+            assert!(current.is_none(), "runnable shell blocks cannot nest");
+            current = Some(String::new());
+        } else if line == "```" {
+            if let Some(block) = current.take() {
+                blocks.push(block);
+            }
+        } else if let Some(block) = &mut current {
+            block.push_str(line);
+            block.push('\n');
+        }
+    }
+
+    assert!(
+        current.is_none(),
+        "README has an unclosed runnable shell block"
+    );
+    blocks
+}
+
+#[test]
+fn cli_readme_commands_are_real() {
+    let readme = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"))
+        .expect("read README");
+    let blocks = runnable_shell_blocks(&readme);
+    assert!(
+        !blocks.is_empty(),
+        "README must mark its executable walkthrough shell blocks as `sh runnable`"
+    );
+
+    let workspace = TempDir::new().expect("temporary README workspace");
+    let output = Command::new("sh")
+        .args(["-eu", "-c", &blocks.join("\n")])
+        .current_dir(workspace.path())
+        .env("STORYBOARD", assert_cmd::cargo::cargo_bin("storyboard"))
+        .env("WORKSPACE", workspace.path())
+        .output()
+        .expect("run README walkthrough");
+    assert!(
+        output.status.success(),
+        "README walkthrough failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        workspace
+            .path()
+            .join("night-station/project.json")
+            .is_file()
+    );
+    assert!(
+        workspace
+            .path()
+            .join("night-station/.cache/panel.png")
+            .is_file()
+    );
+    assert!(
+        workspace
+            .path()
+            .join("night-station/.cache/cut-sheet.png")
+            .is_file()
+    );
+}
+
+#[test]
+fn cli_readme_mcp_setup_invokes_storyboard_mcp() {
+    let readme = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"))
+        .expect("read README");
+    let claude = readme
+        .lines()
+        .find(|line| line.starts_with("claude mcp add storyboard -- "))
+        .expect("README Claude MCP command");
+    let claude_command = claude
+        .split_once(" -- ")
+        .expect("Claude MCP command separator")
+        .1;
+    assert_eq!(claude_command, "\"$STORYBOARD\" mcp \"$WORKSPACE\"");
+
+    let codex_command = readme
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("command = \"")
+                .and_then(|line| line.strip_suffix('\"'))
+        })
+        .expect("README Codex command");
+    assert!(
+        codex_command.starts_with('/'),
+        "Codex command must name an absolute downloaded-binary path"
+    );
+    let codex_args = readme
+        .lines()
+        .find_map(|line| line.strip_prefix("args = "))
+        .expect("README Codex args");
+    assert_eq!(
+        codex_args,
+        "[\"mcp\", \"/absolute/path/to/storyboard-workspace\"]"
+    );
+
+    let help = storyboard()
+        .args(["mcp", "--help"])
+        .output()
+        .expect("MCP help");
+    assert!(help.status.success(), "storyboard mcp must exist");
+    let typo = storyboard()
+        .args(["mpc", "--help"])
+        .output()
+        .expect("typo help");
+    assert!(!typo.status.success(), "storyboard mpc must fail");
 }
 
 #[test]
@@ -417,6 +535,328 @@ fn cli_pretty_help_says_show_only() {
         String::from_utf8(output.stdout)
             .expect("UTF-8 help")
             .contains("show only")
+    );
+}
+
+#[test]
+fn cli_describe_reads_panel_layers_and_pretty_show_points_to_it() {
+    let (_workspace, dir, version) = new_project();
+    let version = add_opening_shot(&dir, &version);
+    let _version = write_version(&dir, &version, &["add-text", "--at", "1", "--text", "Door"]);
+    let described = json(storyboard().args(["describe", dir.to_str().unwrap(), "--at", "1"]));
+    assert_eq!(described["layers"][0]["id"], "layer-1");
+    assert_eq!(described["layers"][0]["kind"], "text");
+    assert_eq!(described["layers"][0]["text"], "Door");
+    assert!(described["timing"]["panel_time"].is_number());
+    assert!(described["notes"].is_string());
+
+    let output = storyboard()
+        .args(["--pretty", "show", dir.to_str().unwrap()])
+        .output()
+        .expect("pretty show");
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("describe --at 1")
+    );
+}
+
+#[test]
+fn cli_sources_show_missing_refs_and_add_ref_warns() {
+    let (_workspace, dir, version) = new_project();
+    let version = add_opening_shot(&dir, &version);
+    let added = write(
+        &dir,
+        &version,
+        &[
+            "add-ref",
+            "--shot",
+            "shot-1",
+            "--reference",
+            "sources/gone.mov",
+        ],
+    );
+    assert!(
+        added["warning"]
+            .as_str()
+            .is_some_and(|value| value.contains("gone.mov"))
+    );
+    assert!(added["summary"].as_str().unwrap().contains("shot shot-1"));
+    let sources = json(storyboard().args(["sources", dir.to_str().unwrap()]));
+    assert_eq!(sources["missing"][0]["path"], "sources/gone.mov");
+    let shown = json(storyboard().args(["show", dir.to_str().unwrap()]));
+    assert!(
+        shown["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["message"].as_str().unwrap().contains("gone.mov"))
+    );
+}
+
+#[test]
+fn cli_notes_all_nests_replies_and_reply_reopens_thread() {
+    let (_workspace, dir, version) = new_project();
+    let note = write(
+        &dir,
+        &version,
+        &["note", "--kind", "question", "--text", "Which door?"],
+    );
+    let resolved = write(
+        &dir,
+        note["version"].as_str().unwrap(),
+        &["resolve", "--sticky", "sticky-1"],
+    );
+    let reply = write(
+        &dir,
+        resolved["version"].as_str().unwrap(),
+        &["reply", "--sticky", "sticky-1", "--text", "The red one"],
+    );
+    assert!(reply["summary"].as_str().unwrap().contains("reopen"));
+    let notes = json(storyboard().args(["notes", dir.to_str().unwrap(), "--all"]));
+    assert_eq!(notes["notes"][0]["resolved"], false);
+    assert_eq!(notes["notes"][0]["replies"][0]["text"], "The red one");
+}
+
+#[test]
+fn cli_has_human_verbs_for_removal_branching_reorder_and_refs() {
+    let help = String::from_utf8(storyboard().arg("--help").output().unwrap().stdout).unwrap();
+    for verb in [
+        "remove-shot",
+        "remove-scene",
+        "remove-panel",
+        "remove-layer",
+        "set-active-cut",
+        "reorder-clip",
+        "add-ref",
+        "remove-ref",
+        "move-shot-to-scene",
+        "reorder-shot",
+    ] {
+        assert!(help.contains(verb), "missing CLI verb {verb}");
+    }
+}
+
+#[test]
+fn cli_surface_verbs_execute_without_json() {
+    let (_workspace, dir, mut version) = new_project();
+    version = write_version(&dir, &version, &["add-scene", "--title", "One"]);
+    version = write_version(&dir, &version, &["add-scene", "--title", "Two"]);
+    version = write_version(
+        &dir,
+        &version,
+        &["add-shot", "--scene", "scene-1", "--title", "A"],
+    );
+    version = write_version(
+        &dir,
+        &version,
+        &["add-shot", "--scene", "scene-1", "--title", "B"],
+    );
+    version = write_version(&dir, &version, &["add-text", "--at", "1", "--text", "Door"]);
+    version = write_version(
+        &dir,
+        &version,
+        &["reorder-shot", "--shot", "shot-2", "--index", "0"],
+    );
+    version = write_version(
+        &dir,
+        &version,
+        &[
+            "move-shot-to-scene",
+            "--shot",
+            "shot-2",
+            "--scene",
+            "scene-2",
+            "--index",
+            "0",
+        ],
+    );
+    version = write_version(
+        &dir,
+        &version,
+        &[
+            "add-ref",
+            "--shot",
+            "shot-1",
+            "--reference",
+            "sources/gone.png",
+        ],
+    );
+    version = write_version(
+        &dir,
+        &version,
+        &[
+            "remove-ref",
+            "--shot",
+            "shot-1",
+            "--reference",
+            "sources/gone.png",
+        ],
+    );
+    version = write_version(&dir, &version, &["add-cut", "--name", "Alt"]);
+    version = write_version(&dir, &version, &["set-active-cut", "--cut", "cut-1"]);
+    version = write_version(
+        &dir,
+        &version,
+        &["add-clip", "--cut", "cut-1", "--shot", "shot-1"],
+    );
+    version = write_version(
+        &dir,
+        &version,
+        &["add-clip", "--cut", "cut-1", "--shot", "shot-2"],
+    );
+    version = write_version(
+        &dir,
+        &version,
+        &[
+            "reorder-clip",
+            "--cut",
+            "cut-1",
+            "--clip",
+            "clip-2",
+            "--index",
+            "0",
+        ],
+    );
+    version = write_version(
+        &dir,
+        &version,
+        &["remove-clip", "--cut", "cut-1", "--clip", "clip-1"],
+    );
+    version = write_version(
+        &dir,
+        &version,
+        &[
+            "remove-layer",
+            "--shot",
+            "shot-1",
+            "--take",
+            "take-1",
+            "--panel",
+            "panel-1",
+            "--layer",
+            "layer-1",
+        ],
+    );
+    version = write_version(
+        &dir,
+        &version,
+        &[
+            "remove-panel",
+            "--shot",
+            "shot-1",
+            "--take",
+            "take-1",
+            "--panel",
+            "panel-1",
+        ],
+    );
+    version = write_version(&dir, &version, &["remove-shot", "--shot", "shot-1"]);
+    let _version = write_version(&dir, &version, &["remove-scene", "--scene", "scene-1"]);
+}
+
+#[test]
+fn cli_failed_new_removes_created_project_folder() {
+    let workspace = TempDir::new().unwrap();
+    let project = workspace.path().join("invalid");
+    let rejected = error(storyboard().args([
+        "new",
+        project.to_str().unwrap(),
+        "--title",
+        "Bad",
+        "--fps",
+        "23",
+    ]));
+    assert_eq!(rejected["error"]["kind"], "validation");
+    assert!(
+        !project.exists(),
+        "failed new left its project folder behind"
+    );
+}
+
+#[test]
+fn cli_import_collision_has_actionable_hint() {
+    let (workspace, dir, _version) = new_project();
+    let input = workspace.path().join("input.txt");
+    fs::write(&input, "one").unwrap();
+    json(storyboard().args([
+        "import",
+        dir.to_str().unwrap(),
+        input.to_str().unwrap(),
+        "--destination",
+        "same.txt",
+    ]));
+    let rejected = error(storyboard().args([
+        "import",
+        dir.to_str().unwrap(),
+        input.to_str().unwrap(),
+        "--destination",
+        "same.txt",
+    ]));
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("same.txt")
+    );
+    assert!(
+        rejected["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("choose another name")
+    );
+}
+
+#[test]
+fn cli_schema_single_op_carries_referenced_defs() {
+    let schema = json(storyboard().args(["schema", "add-ref"]));
+    assert!(schema["op"].to_string().contains("#/$defs/RefTarget"));
+    assert!(schema["$defs"]["RefTarget"].is_object());
+}
+
+#[test]
+fn cli_thirty_scene_add_text_and_board_render_stays_under_two_seconds() {
+    use std::time::{Duration, Instant};
+
+    use storyboard_cli::{args::PanelImageArgs, ops_api};
+    use storyboard_core::Author;
+
+    let (_workspace, project, version) = fixture_support::thirty_scene_project();
+    let started = Instant::now();
+    let op = ops_api::add_text_op(
+        &project,
+        None,
+        None,
+        None,
+        Some("1"),
+        "Performance marker".into(),
+        0.0,
+        0.0,
+        400.0,
+        100.0,
+        32.0,
+        "#000000".into(),
+    )
+    .expect("build add-text op");
+    ops_api::commit_ops(&project, &version, vec![op], Author::Human, None)
+        .expect("commit add-text");
+    ops_api::panel_image(PanelImageArgs {
+        dir: project,
+        shot: None,
+        take: None,
+        panel: None,
+        at: Some("1".into()),
+        width: 960,
+        mode: "board".into(),
+        out: None,
+    })
+    .expect("render board panel");
+    let elapsed = started.elapsed();
+    eprintln!("30-scene add-text plus board render: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "edit plus render took {elapsed:?}"
     );
 }
 
