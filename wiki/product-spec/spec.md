@@ -80,6 +80,8 @@ A new shot gets a take and a blank panel. New objects get short readable ids (`s
 
 `history/log.jsonl` holds ops, inverses, author, time, note and a generated one-line summary. Snapshots are written every 50 commits, not per commit. A torn log tail is repaired on open. Undo commits the inverses, under the same rebase rule.
 
+Amendment 2026-11-10 (owner: 'finish 10-20'): Redo re-applies an author's most recently undone commits, per author, under the same rebase rule; a new commit by that author clears their redo.
+
 Agents cannot land a sticky under any author but themselves, and nothing changes the author of a stored sticky. Without `--author`, a non-terminal CLI write is refused, unless `NB_AUTHOR` is set.
 
 ## Sources
