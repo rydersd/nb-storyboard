@@ -145,8 +145,10 @@ pub(super) fn waveform(state: &State, query: &HashMap<String, String>) -> Result
     }
     let samples: Vec<i16> = output
         .stdout
-        .chunks_exact(2)
-        .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|bytes| i16::from_le_bytes(*bytes))
         .collect();
     let mut peaks = vec![0u16; 128];
     for (index, sample) in samples.iter().enumerate() {

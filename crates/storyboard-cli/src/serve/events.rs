@@ -138,15 +138,21 @@ pub(super) fn author_label(author: &Author) -> String {
 /// Server-sent events, written straight to the connection and flushed per event. tiny_http's own
 /// response path buffers chunked bodies, which would hold events back.
 pub(super) fn events(state: &State, request: Request) {
-    if state
-        .active_event_streams
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < MAX_EVENT_STREAMS).then_some(active + 1)
-        })
-        .is_err()
-    {
-        let _ = request.respond(text_response(503, "too many live-update connections"));
-        return;
+    let mut active = state.active_event_streams.load(Ordering::Acquire);
+    loop {
+        if active >= MAX_EVENT_STREAMS {
+            let _ = request.respond(text_response(503, "too many live-update connections"));
+            return;
+        }
+        match state.active_event_streams.compare_exchange_weak(
+            active,
+            active + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(seen) => active = seen,
+        }
     }
     let id = state.next_event_id.fetch_add(1, Ordering::Relaxed);
     let _slot = EventSlot { state, id };
