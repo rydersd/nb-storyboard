@@ -1999,8 +1999,10 @@ fn cli_export_holds_last_frame_while_voice_over_continues() {
     assert!(
         late_voice
             .stdout
-            .chunks_exact(2)
-            .any(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]).unsigned_abs() > 500),
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .any(|bytes| i16::from_le_bytes(*bytes).unsigned_abs() > 500),
         "voice-over should continue after the movie ends"
     );
 
@@ -2127,8 +2129,10 @@ fn cli_export_uses_placement_voice_only_for_that_clip() {
         assert!(decoded.status.success());
         decoded
             .stdout
-            .chunks_exact(2)
-            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]).unsigned_abs())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| i16::from_le_bytes(*bytes).unsigned_abs())
             .max()
             .unwrap_or_default()
     };
@@ -2340,8 +2344,10 @@ fn cli_exports_more_than_256_cut_segments_without_dropping_frames() {
         assert!(
             samples
                 .stdout
-                .chunks_exact(2)
-                .any(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]).unsigned_abs() > 500),
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .any(|bytes| i16::from_le_bytes(*bytes).unsigned_abs() > 500),
             "audio missing after a chunk boundary at {time}s"
         );
     }
