@@ -24,6 +24,8 @@ pub struct CommitRecord {
     pub external: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undoes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redoes: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -34,6 +36,8 @@ pub struct CommitSummary {
     pub author: Author,
     pub summary: String,
     pub external: bool,
+    /// Public history clients use these stable operation paths to reveal the exact changed item.
+    pub footprints: Vec<String>,
 }
 
 impl From<&CommitRecord> for CommitSummary {
@@ -45,6 +49,7 @@ impl From<&CommitRecord> for CommitSummary {
             author: value.author.clone(),
             summary: value.summary.clone(),
             external: value.external,
+            footprints: value.footprints.clone(),
         }
     }
 }

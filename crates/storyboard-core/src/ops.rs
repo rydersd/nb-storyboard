@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
-    Author, Clip, ClipSource, Cut, ExtraFields, Layer, Panel, Pin, Position, Project, Scene, Shot,
-    Sticky, Take, ValidationIssue, footprint::sorted, validate,
+    Author, Clip, ClipSource, Cut, CutSource, ExtraFields, Layer, Panel, Pin, Position, Project,
+    Scene, Shot, Sticky, Take, ValidationIssue, footprint::sorted, validate,
 };
 
 pub type Patch = Map<String, Value>;
@@ -43,6 +43,11 @@ pub enum Op {
         scene: String,
         id: Option<String>,
         title: String,
+        index: Option<usize>,
+    },
+    DuplicateShot {
+        shot: String,
+        id: Option<String>,
         index: Option<usize>,
     },
     RemoveShot {
@@ -177,6 +182,21 @@ pub enum Op {
         cut: String,
         clip: String,
         patch: Patch,
+    },
+    MergeClips {
+        cut: String,
+        left: String,
+        right: String,
+    },
+    GroupClips {
+        cut: String,
+        left: String,
+        right: String,
+        name: String,
+    },
+    UngroupClips {
+        cut: String,
+        clip: String,
     },
     AddCut {
         id: Option<String>,
@@ -773,6 +793,8 @@ fn execute(project: &mut Project, op: &Op, effect: &mut Effect) -> Result<(), Op
                 camera: String::new(),
                 notes: String::new(),
                 duration: 2.0,
+                source_movie: None,
+                source_audio: None,
                 status: "draft".into(),
                 selected_take: take_id.clone(),
                 takes: vec![Take {
@@ -796,6 +818,28 @@ fn execute(project: &mut Project, op: &Op, effect: &mut Effect) -> Result<(), Op
             effect.created(shot_id);
             effect.created(take_id);
             effect.created(panel_id);
+        }
+        Op::DuplicateShot { shot, id, index } => {
+            let (scene_index, source_index) = shot_location(project, shot)?;
+            let id = next_id(project, "shot", id.as_deref())?;
+            let mut duplicate = project.scenes[scene_index].shots[source_index].clone();
+            duplicate.id = id.clone();
+            if !duplicate.title.is_empty() {
+                duplicate.title.push_str(" copy");
+            }
+            let nested_ids = freshen_shot(project, &mut duplicate);
+            let scene = &mut project.scenes[scene_index];
+            let destination = index.unwrap_or(source_index + 1);
+            insert(&mut scene.shots, destination, duplicate, "index")?;
+            effect.touch(format!("shot/{shot}"));
+            effect.touch(format!("shot/{id}"));
+            effect.touch(format!("scene/{}/order", scene.id));
+            effect.touch("ids/shot");
+            effect.created(id);
+            for (kind, nested_id) in nested_ids {
+                effect.touch(format!("ids/{kind}"));
+                effect.created(nested_id);
+            }
         }
         Op::RemoveShot { shot } => {
             refuse_shots_in_cuts(project, &HashSet::from([shot.clone()]))?;
@@ -831,14 +875,41 @@ fn execute(project: &mut Project, op: &Op, effect: &mut Effect) -> Result<(), Op
             effect.touch(format!("scene/{scene_id}/order"));
         }
         Op::UpdateShot { shot, patch } => {
+            let derive_duration = !patch.contains_key("duration")
+                && (patch.contains_key("source_movie") || patch.contains_key("source_audio"));
+            let shot_obj = shot_mut(project, shot)?;
             patch_value(
-                shot_mut(project, shot)?,
+                shot_obj,
                 patch,
                 &[
-                    "title", "action", "dialogue", "speaker", "camera", "notes", "duration",
+                    "title",
+                    "action",
+                    "dialogue",
+                    "speaker",
+                    "camera",
+                    "notes",
+                    "duration",
                     "status",
+                    "source_movie",
+                    "source_audio",
                 ],
             )?;
+            if derive_duration {
+                let media_end = shot_obj
+                    .source_movie
+                    .as_ref()
+                    .map_or(0.0, |movie| movie.end - movie.start)
+                    .max(
+                        shot_obj
+                            .source_audio
+                            .as_ref()
+                            .map_or(0.0, |audio| audio.end - audio.start),
+                    );
+                if media_end > shot_obj.duration {
+                    shot_obj.duration = media_end;
+                    effect.touch(format!("shot/{shot}/timing"));
+                }
+            }
             for key in patch.keys() {
                 if key == "duration" {
                     effect.touch(format!("shot/{shot}/timing"));
@@ -1310,6 +1381,7 @@ fn execute(project: &mut Project, op: &Op, effect: &mut Effect) -> Result<(), Op
                 Clip {
                     id: id.clone(),
                     source: source.clone(),
+                    source_audio: None,
                     in_frame: 0,
                     out_frame: None,
                     slot: None,
@@ -1342,7 +1414,11 @@ fn execute(project: &mut Project, op: &Op, effect: &mut Effect) -> Result<(), Op
         }
         Op::UpdateClip { cut, clip, patch } => {
             let clip = clip_mut(project, cut, clip)?;
-            patch_value(clip, patch, &["source", "in", "out", "slot"])?;
+            patch_value(
+                clip,
+                patch,
+                &["source", "source_audio", "in", "out", "slot"],
+            )?;
             for key in patch.keys() {
                 if ["in", "out", "slot"].contains(&key.as_str()) {
                     effect.touch(format!("cut/{cut}/clip/{}/trim", clip.id));
@@ -1353,6 +1429,166 @@ fn execute(project: &mut Project, op: &Op, effect: &mut Effect) -> Result<(), Op
             if patch.contains_key("source") {
                 touch_clip_source(effect, &clip.source);
             }
+        }
+        Op::MergeClips { cut, left, right } => {
+            let parent = cut_mut(project, cut)?;
+            let index = by_id(&parent.clips, left, |clip| &clip.id, "clip")?;
+            let Some(next) = parent.clips.get(index + 1) else {
+                return Err(OpError::at("clips", "merge two adjacent shot placements"));
+            };
+            let first = &parent.clips[index];
+            if next.id != *right
+                || !matches!(first.source, ClipSource::Shot(_))
+                || first.source != next.source
+                || first.source_audio != next.source_audio
+                || first.slot.is_some()
+                || next.slot.is_some()
+                || first.out_frame != Some(next.in_frame)
+                || !next.extra.is_empty()
+            {
+                return Err(OpError::at(
+                    "clips",
+                    "merge requires adjacent contiguous parts of the same shot with matching audio and no right-clip metadata",
+                ));
+            }
+            let out = next.out_frame;
+            parent.clips[index].out_frame = out;
+            parent.clips.remove(index + 1);
+            for sticky in &mut project.stickies {
+                if let Pin::Clip {
+                    cut: pin_cut,
+                    clip: pin_clip,
+                } = &mut sticky.pin
+                    && pin_cut == cut
+                    && pin_clip == right
+                {
+                    *pin_clip = left.clone();
+                    effect.touch(format!("sticky/{}", sticky.id));
+                }
+            }
+            effect.touch(format!("clip/{cut}/{left}"));
+            effect.touch(format!("clip/{cut}/{right}"));
+            effect.touch(format!("cut/{cut}/order"));
+            effect.touch("ids/clip");
+        }
+        Op::GroupClips {
+            cut,
+            left,
+            right,
+            name,
+        } => {
+            let group_id = next_id(project, "cut", None)?;
+            let wrapper_id = next_id(project, "clip", None)?;
+            let parent = cut_mut(project, cut)?;
+            let index = by_id(&parent.clips, left, |clip| &clip.id, "clip")?;
+            if parent
+                .clips
+                .get(index + 1)
+                .is_none_or(|clip| clip.id != *right)
+                || !matches!(parent.clips[index].source, ClipSource::Shot(_))
+                || !matches!(parent.clips[index + 1].source, ClipSource::Shot(_))
+            {
+                return Err(OpError::at("clips", "group two adjacent shot placements"));
+            }
+            let children = parent.clips.drain(index..=index + 1).collect();
+            parent.clips.insert(
+                index,
+                Clip {
+                    id: wrapper_id.clone(),
+                    source: ClipSource::Cut(CutSource {
+                        cut: group_id.clone(),
+                        extra: ExtraFields::new(),
+                        source_extra: ExtraFields::new(),
+                    }),
+                    source_audio: None,
+                    in_frame: 0,
+                    out_frame: None,
+                    slot: None,
+                    extra: ExtraFields::new(),
+                },
+            );
+            project.cuts.push(Cut {
+                id: group_id.clone(),
+                name: name.clone(),
+                clips: children,
+                extra: ExtraFields::new(),
+            });
+            for sticky in &mut project.stickies {
+                if let Pin::Clip { cut: pin_cut, clip } = &mut sticky.pin
+                    && pin_cut == cut
+                    && (clip == left || clip == right)
+                {
+                    *pin_cut = group_id.clone();
+                    effect.touch(format!("sticky/{}", sticky.id));
+                }
+            }
+            effect.touch(format!("cut/{cut}"));
+            effect.touch(format!("cut/{group_id}"));
+            effect.touch("cut/order");
+            effect.touch("ids/clip");
+            effect.touch("ids/cut");
+            effect.created(wrapper_id);
+            effect.created(group_id);
+        }
+        Op::UngroupClips { cut, clip } => {
+            let parent = cut_mut(project, cut)?;
+            let index = by_id(&parent.clips, clip, |clip| &clip.id, "clip")?;
+            let wrapper = &parent.clips[index];
+            let ClipSource::Cut(source) = &wrapper.source else {
+                return Err(OpError::at("clip", "select a grouped placement"));
+            };
+            if wrapper.in_frame != 0
+                || wrapper.out_frame.is_some()
+                || wrapper.slot.is_some()
+                || wrapper.source_audio.is_some()
+                || !wrapper.extra.is_empty()
+                || !source.extra.is_empty()
+                || !source.source_extra.is_empty()
+            {
+                return Err(OpError::at(
+                    "clip",
+                    "clear group trims, slot, audio and metadata before ungrouping",
+                ));
+            }
+            let group_id = source.cut.clone();
+            let group = project
+                .cuts
+                .iter()
+                .find(|candidate| candidate.id == group_id)
+                .ok_or_else(|| OpError::at("cut", "group cut is missing"))?;
+            if !group.extra.is_empty() {
+                return Err(OpError::at("cut", "group cut metadata must be preserved"));
+            }
+            if project.stickies.iter().any(|sticky| matches!(&sticky.pin, Pin::Clip { cut: pin_cut, clip: pin_clip } if pin_cut == cut && pin_clip == clip)) {
+                return Err(OpError::at("clip", "move notes pinned to the group before ungrouping"));
+            }
+            let references = project.cuts.iter().flat_map(|candidate| &candidate.clips)
+                .filter(|candidate| matches!(&candidate.source, ClipSource::Cut(source) if source.cut == group_id)).count();
+            if references != 1 {
+                return Err(OpError::at("clip", "group is also used by another cut"));
+            }
+            let group_index = by_id(&project.cuts, &group_id, |candidate| &candidate.id, "cut")?;
+            let children = project.cuts.remove(group_index).clips;
+            let parent = cut_mut(project, cut)?;
+            let index = by_id(&parent.clips, clip, |candidate| &candidate.id, "clip")?;
+            parent.clips.splice(index..=index, children);
+            for sticky in &mut project.stickies {
+                if let Pin::Clip { cut: pin_cut, .. } = &mut sticky.pin
+                    && *pin_cut == group_id
+                {
+                    *pin_cut = cut.clone();
+                    effect.touch(format!("sticky/{}", sticky.id));
+                }
+            }
+            if project.active_cut.as_deref() == Some(&group_id) {
+                project.active_cut = Some(cut.clone());
+                effect.touch("active_cut");
+            }
+            effect.touch(format!("cut/{cut}"));
+            effect.touch(format!("cut/{group_id}"));
+            effect.touch("cut/order");
+            effect.touch("ids/clip");
+            effect.touch("ids/cut");
         }
         Op::AddCut { id, name, index } => {
             let id = next_id(project, "cut", id.as_deref())?;
@@ -1433,6 +1669,12 @@ fn execute(project: &mut Project, op: &Op, effect: &mut Effect) -> Result<(), Op
             index,
         } => {
             let refs = refs_mut(project, target)?;
+            if refs.iter().any(|existing| existing == reference) {
+                return Err(OpError::at(
+                    "reference",
+                    format!("ref already exists: {reference}"),
+                ));
+            }
             insert(
                 refs,
                 index.unwrap_or(refs.len()),
@@ -2686,6 +2928,31 @@ fn freshen_take(project: &Project, take: &mut Take) -> Vec<(&'static str, String
         for layer in &mut panel.layers {
             layer.id = fresh_from(&mut layers, "layer");
             created.push(("layer", layer.id.clone()));
+        }
+    }
+    created
+}
+
+fn freshen_shot(project: &Project, shot: &mut Shot) -> Vec<(&'static str, String)> {
+    let mut takes = kind_ids(project, "take");
+    let mut panels = kind_ids(project, "panel");
+    let mut layers = kind_ids(project, "layer");
+    let selected = shot.selected_take.clone();
+    let mut created = Vec::new();
+    for take in &mut shot.takes {
+        let old_id = take.id.clone();
+        take.id = fresh_from(&mut takes, "take");
+        if old_id == selected {
+            shot.selected_take = take.id.clone();
+        }
+        created.push(("take", take.id.clone()));
+        for panel in &mut take.panels {
+            panel.id = fresh_from(&mut panels, "panel");
+            created.push(("panel", panel.id.clone()));
+            for layer in &mut panel.layers {
+                layer.id = fresh_from(&mut layers, "layer");
+                created.push(("layer", layer.id.clone()));
+            }
         }
     }
     created

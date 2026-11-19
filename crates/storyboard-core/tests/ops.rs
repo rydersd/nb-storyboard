@@ -4,6 +4,7 @@ use serde_json::{Map, Value, json};
 use storyboard_core::ops::{RestoreAction, RestoreParent, RestoreTarget};
 use storyboard_core::{
     Author, ClipSource, Op, Pin, Position, Project, RefTarget, Scene, ShotSource, apply,
+    compile_active,
     footprint::{disjoint, overlaps},
     validate,
 };
@@ -12,6 +13,223 @@ const SMALL: &str = include_str!("fixtures/small.json");
 
 fn fixture() -> Project {
     serde_json::from_str(SMALL).expect("the small fixture is a project")
+}
+
+#[test]
+fn duplicate_add_ref_to_the_same_take_is_a_validation_error_that_names_the_ref() {
+    let mut project = fixture();
+    let duplicate = Op::Batch {
+        ops: vec![
+            Op::AddRef {
+                target: RefTarget::Take {
+                    shot: "shot-1".into(),
+                    take: "take-1".into(),
+                },
+                reference: "refs/door.png".into(),
+                index: None,
+            },
+            Op::AddRef {
+                target: RefTarget::Take {
+                    shot: "shot-1".into(),
+                    take: "take-1".into(),
+                },
+                reference: "refs/door.png".into(),
+                index: None,
+            },
+        ],
+    };
+
+    let error = apply(&mut project, &duplicate).expect_err("duplicate ref must be refused");
+    assert_eq!(error.field, "reference");
+    assert!(error.message.contains("refs/door.png"), "{}", error.message);
+    assert!(project.scenes[0].shots[0].takes[0].refs.is_empty());
+}
+
+#[test]
+fn agent_media_patch_extends_timing_without_overriding_an_explicit_duration() {
+    let mut project = fixture();
+    let original = project.clone();
+    let attached = apply(
+        &mut project,
+        &Op::UpdateShot {
+            shot: "shot-1".into(),
+            patch: patch([(
+                "source_audio",
+                json!({
+                    "src": "sources/imported-audio/voice/original.wav", "start": 1.0, "end": 4.0
+                }),
+            )]),
+        },
+    )
+    .unwrap();
+    assert_eq!(project.scenes[0].shots[0].duration, 3.0);
+    assert_eq!(compile_active(&project).unwrap().items[0].end, 72);
+    assert!(attached.footprints.contains(&"shot/shot-1/timing".into()));
+    for inverse in &attached.inverse {
+        apply(&mut project, inverse).unwrap();
+    }
+    assert_eq!(project, original);
+
+    apply(
+        &mut project,
+        &Op::UpdateShot {
+            shot: "shot-1".into(),
+            patch: patch([
+                ("source_movie", json!({"src": "sources/imported-movies/film/original.mp4", "start": 0.0, "end": 5.0})),
+                ("duration", json!(1.0)),
+            ]),
+        },
+    )
+    .unwrap();
+    assert_eq!(project.scenes[0].shots[0].duration, 1.0);
+}
+
+#[test]
+fn group_distinct_placements_keeps_media_metadata_and_clip_notes() {
+    let mut project = fixture();
+    project.cuts[0].clips[1].source = shot_source("shot-2", None);
+    project.cuts[0].clips[0]
+        .extra
+        .insert("future_clip_data".into(), json!("kept"));
+    project.cuts[0].clips[1].in_frame = 2;
+    project.cuts[0].clips[1].out_frame = Some(20);
+    project.stickies[0].pin = Pin::Clip {
+        cut: "cut-main".into(),
+        clip: "clip-2".into(),
+    };
+    let before = project.clone();
+    let frames = compile_active(&project).unwrap().frames;
+    let grouped = apply(
+        &mut project,
+        &Op::GroupClips {
+            cut: "cut-main".into(),
+            left: "clip-1".into(),
+            right: "clip-2".into(),
+            name: "Revision pair".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(compile_active(&project).unwrap().frames, frames);
+    assert_eq!(project.cuts[0].clips.len(), 1);
+    let ClipSource::Cut(source) = &project.cuts[0].clips[0].source else {
+        panic!("wrapper must target a cut")
+    };
+    let group_id = source.cut.clone();
+    let wrapper_id = project.cuts[0].clips[0].id.clone();
+    let child = project.cuts.iter().find(|cut| cut.id == group_id).unwrap();
+    assert_eq!(child.clips[0], before.cuts[0].clips[0]);
+    assert_eq!(child.clips[1], before.cuts[0].clips[1]);
+    project.cuts[0].clips[0]
+        .extra
+        .insert("future_group_data".into(), json!(true));
+    assert!(
+        apply(
+            &mut project,
+            &Op::UngroupClips {
+                cut: "cut-main".into(),
+                clip: wrapper_id.clone(),
+            },
+        )
+        .is_err()
+    );
+    project.cuts[0].clips[0].extra.clear();
+    project
+        .cuts
+        .iter_mut()
+        .find(|cut| cut.id == group_id)
+        .unwrap()
+        .extra
+        .insert("future_cut_data".into(), json!(true));
+    assert!(
+        apply(
+            &mut project,
+            &Op::UngroupClips {
+                cut: "cut-main".into(),
+                clip: wrapper_id.clone(),
+            },
+        )
+        .is_err()
+    );
+    project
+        .cuts
+        .iter_mut()
+        .find(|cut| cut.id == group_id)
+        .unwrap()
+        .extra
+        .clear();
+    assert_eq!(
+        project.stickies[0].pin,
+        Pin::Clip {
+            cut: group_id.clone(),
+            clip: "clip-2".into()
+        }
+    );
+    apply(
+        &mut project,
+        &Op::UngroupClips {
+            cut: "cut-main".into(),
+            clip: wrapper_id,
+        },
+    )
+    .unwrap();
+    assert_eq!(project, before);
+    let mut undo_project = before.clone();
+    apply(
+        &mut undo_project,
+        &Op::GroupClips {
+            cut: "cut-main".into(),
+            left: "clip-1".into(),
+            right: "clip-2".into(),
+            name: "Revision pair".into(),
+        },
+    )
+    .unwrap();
+    for inverse in grouped.inverse {
+        apply(&mut undo_project, &inverse).unwrap();
+    }
+    assert_eq!(undo_project, before);
+}
+
+#[test]
+fn merge_adjacent_parts_repins_notes_and_refuses_metadata_loss() {
+    let mut project = fixture();
+    project.cuts[0].clips[1].source = shot_source("shot-1", None);
+    project.cuts[0].clips[0].out_frame = Some(20);
+    project.cuts[0].clips[1].in_frame = 20;
+    project.stickies[0].pin = Pin::Clip {
+        cut: "cut-main".into(),
+        clip: "clip-2".into(),
+    };
+    let operation = Op::MergeClips {
+        cut: "cut-main".into(),
+        left: "clip-1".into(),
+        right: "clip-2".into(),
+    };
+    project.cuts[0].clips[1]
+        .extra
+        .insert("future_clip_data".into(), json!(true));
+    let with_metadata = project.clone();
+    assert!(apply(&mut project, &operation).is_err());
+    assert_eq!(project, with_metadata);
+    project.cuts[0].clips[1].extra.clear();
+    let before = project.clone();
+    let frames = compile_active(&project).unwrap().frames;
+    let result = apply(&mut project, &operation).unwrap();
+    assert_eq!(project.cuts[0].clips.len(), 1);
+    assert_eq!(project.cuts[0].clips[0].id, "clip-1");
+    assert_eq!(project.cuts[0].clips[0].out_frame, None);
+    assert_eq!(compile_active(&project).unwrap().frames, frames);
+    assert_eq!(
+        project.stickies[0].pin,
+        Pin::Clip {
+            cut: "cut-main".into(),
+            clip: "clip-1".into()
+        }
+    );
+    for inverse in result.inverse {
+        apply(&mut project, &inverse).unwrap();
+    }
+    assert_eq!(project, before);
 }
 
 fn patch(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Map<String, Value> {
@@ -201,6 +419,15 @@ fn cases() -> Vec<Case> {
                 scene: "scene-1".into(),
                 id: Some("shot-new".into()),
                 title: "New".into(),
+                index: Some(1),
+            },
+        },
+        Case {
+            name: "duplicate_shot",
+            setup: no_setup,
+            op: Op::DuplicateShot {
+                shot: "shot-1".into(),
+                id: Some("shot-copy".into()),
                 index: Some(1),
             },
         },
@@ -567,6 +794,7 @@ inverse_tests! {
     op_move_scene_inverts => "move_scene";
     op_update_scene_inverts => "update_scene";
     op_add_shot_inverts => "add_shot";
+    op_duplicate_shot_inverts => "duplicate_shot";
     op_remove_shot_inverts => "remove_shot";
     op_move_shot_inverts => "move_shot";
     op_update_shot_inverts => "update_shot";
@@ -852,6 +1080,56 @@ fn duplicate_take_reports_take_panel_and_layer_ids() {
         applied.created_ids.into_iter().collect::<BTreeSet<_>>(),
         expected
     );
+}
+
+#[test]
+fn duplicate_shot_rekeys_every_nested_id_and_preserves_sources() {
+    let mut project = fixture();
+    let original = project.scenes[0].shots[0].clone();
+    let applied = apply(
+        &mut project,
+        &Op::DuplicateShot {
+            shot: original.id.clone(),
+            id: Some("shot-copy".into()),
+            index: None,
+        },
+    )
+    .unwrap();
+    let copy = &project.scenes[0].shots[1];
+    assert_eq!(copy.id, "shot-copy");
+    assert_eq!(copy.title, format!("{} copy", original.title));
+    assert_eq!(copy.source_movie, original.source_movie);
+    assert_eq!(copy.source_audio, original.source_audio);
+    assert_eq!(copy.takes.len(), original.takes.len());
+    assert_ne!(copy.selected_take, original.selected_take);
+    assert_eq!(copy.selected_take, copy.takes[0].id);
+    for (take, source) in copy.takes.iter().zip(&original.takes) {
+        assert_ne!(take.id, source.id);
+        for (panel, source_panel) in take.panels.iter().zip(&source.panels) {
+            assert_ne!(panel.id, source_panel.id);
+            for (layer, source_layer) in panel.layers.iter().zip(&source_panel.layers) {
+                assert_ne!(layer.id, source_layer.id);
+                assert_eq!(layer.src, source_layer.src);
+            }
+        }
+    }
+    let created = applied.created_ids.into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(
+        created.len(),
+        1 + copy.takes.len()
+            + copy
+                .takes
+                .iter()
+                .map(|take| take.panels.len())
+                .sum::<usize>()
+            + copy
+                .takes
+                .iter()
+                .flat_map(|take| &take.panels)
+                .map(|panel| panel.layers.len())
+                .sum::<usize>()
+    );
+    assert!(created.contains("shot-copy"));
 }
 
 #[test]
@@ -1832,7 +2110,7 @@ fn footprint_disjoint_pairs_commute_and_inverse_keeps_the_other_change() {
     let operations = pair_ops();
     assert_eq!(
         operations.len(),
-        92,
+        93, // DuplicateShot adds one public operation with its own footprint case.
         "the matrix must keep its review breadth"
     );
     let mut effects = Vec::new();
@@ -1937,7 +2215,7 @@ fn footprint_disjoint_pairs_commute_and_inverse_keeps_the_other_change() {
             }
         }
     }
-    assert_eq!(ordered_pairs, 8_372);
+    assert_eq!(ordered_pairs, operations.len() * (operations.len() - 1));
     assert!(
         checked >= 1_000,
         "only {checked} disjoint pairs were exercised"

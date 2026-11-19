@@ -3,7 +3,9 @@ use std::path::Path;
 
 use serde_json::{Map, json};
 use storyboard_core::{AgentAuthor, Author, Format, Op};
-use storyboard_store::{CommitError, commit, create, history, index, open, open_workspace, undo};
+use storyboard_store::{
+    CommitError, commit, create, history, index, open, open_workspace, redo, undo,
+};
 
 fn format() -> Format {
     Format {
@@ -236,6 +238,147 @@ fn stale_commit_conflicts_with_an_intervening_undo_record() {
         "shot-1",
         "the stale write must not overwrite undo {}",
         bob_undo.version
+    );
+}
+
+#[test]
+fn redo_reapplies_the_latest_undone_occurrence_and_records_its_target() {
+    let directory = project();
+    let seeded = seed_shot(directory.path());
+    let changed = commit_one(
+        directory.path(),
+        &seeded.version,
+        update_shot("shot-1", "Alice title"),
+        agent("alice"),
+    );
+    let undone = undo(directory.path(), &changed.version, agent("alice"), 1).expect("undo");
+    assert_eq!(undone.version, seeded.version);
+
+    let redone = redo(directory.path(), &undone.version, agent("alice"), 1).expect("redo");
+    assert_eq!(redone.version, changed.version);
+    assert_eq!(redone.redoes.as_deref(), Some(changed.version.as_str()));
+    assert_eq!(
+        open(directory.path()).expect("open").project.scenes[0].shots[0].title,
+        "Alice title"
+    );
+    let records = history(directory.path(), usize::MAX).expect("history");
+    assert_eq!(records[0].redoes.as_deref(), Some(changed.version.as_str()));
+}
+
+#[test]
+fn stale_redo_does_not_switch_to_a_different_undone_commit() {
+    let directory = project();
+    let initial = open(directory.path()).expect("open").version;
+    let scene_a = commit_one(
+        directory.path(),
+        &initial,
+        add_scene("scene-a"),
+        Author::Human,
+    );
+    let scene_b = commit_one(
+        directory.path(),
+        &scene_a.version,
+        add_scene("scene-b"),
+        Author::Human,
+    );
+
+    let undo_b = undo(directory.path(), &scene_b.version, Author::Human, 1).expect("undo B");
+    let undo_a = undo(directory.path(), &undo_b.version, Author::Human, 1).expect("undo A");
+
+    let stale_redo = redo(directory.path(), &undo_b.version, Author::Human, 1);
+    match stale_redo {
+        Err(CommitError::Conflict {
+            current_version,
+            intervening,
+            ..
+        }) => {
+            assert_eq!(current_version, undo_a.version);
+            assert_eq!(
+                intervening
+                    .iter()
+                    .map(|record| &record.version)
+                    .collect::<Vec<_>>(),
+                vec![&undo_a.version],
+                "the stale tab must be shown the history it missed"
+            );
+        }
+        other => panic!("stale redo must conflict instead of redoing scene A: {other:?}"),
+    }
+    let document = open(directory.path()).expect("open").project;
+    assert!(
+        document.scenes.is_empty(),
+        "stale redo must not redo scene A"
+    );
+}
+
+#[test]
+fn redo_is_per_author_and_a_new_commit_clears_only_that_authors_redo() {
+    let directory = project();
+    let seeded = seed_shot(directory.path());
+    let alice = commit_one(
+        directory.path(),
+        &seeded.version,
+        update_shot("shot-1", "Alice title"),
+        agent("alice"),
+    );
+    let bob = commit_one(
+        directory.path(),
+        &alice.version,
+        add_scene("bob-scene"),
+        agent("bob"),
+    );
+    let bob_undo = undo(directory.path(), &bob.version, agent("bob"), 1).expect("bob undo");
+    let alice_undo =
+        undo(directory.path(), &bob_undo.version, agent("alice"), 1).expect("alice undo");
+    let alice_new = commit_one(
+        directory.path(),
+        &alice_undo.version,
+        update_shot("shot-1", "Alice replacement"),
+        agent("alice"),
+    );
+
+    let no_alice_redo = redo(directory.path(), &alice_new.version, agent("alice"), 1);
+    assert!(
+        matches!(no_alice_redo, Err(CommitError::Conflict { .. })),
+        "{no_alice_redo:?}"
+    );
+    redo(directory.path(), &alice_new.version, agent("bob"), 1)
+        .expect("bob redo survives alice commit");
+    assert!(
+        open(directory.path())
+            .expect("open")
+            .project
+            .scenes
+            .iter()
+            .any(|scene| scene.id == "bob-scene")
+    );
+}
+
+#[test]
+fn redo_conflicts_with_a_later_overlapping_commit() {
+    let directory = project();
+    let seeded = seed_shot(directory.path());
+    let alice = commit_one(
+        directory.path(),
+        &seeded.version,
+        update_shot("shot-1", "Alice title"),
+        agent("alice"),
+    );
+    let undone = undo(directory.path(), &alice.version, agent("alice"), 1).expect("undo");
+    let bob = commit_one(
+        directory.path(),
+        &undone.version,
+        update_shot("shot-1", "Bob title"),
+        agent("bob"),
+    );
+    let result = redo(directory.path(), &bob.version, agent("alice"), 1);
+    assert!(
+        matches!(result, Err(CommitError::Conflict { .. })),
+        "{result:?}"
+    );
+    assert_eq!(
+        open(directory.path()).expect("open").project.scenes[0].shots[0].title,
+        "Bob title"
     );
 }
 

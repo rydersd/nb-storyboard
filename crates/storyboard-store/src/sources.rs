@@ -99,16 +99,124 @@ pub fn import_source(dir: &Path, source: &Path, destination: &Path) -> Result<Pa
     Ok(relative)
 }
 
+/// Copy bytes received by the workbench into a new source file, with the same containment and
+/// no-overwrite checks as file-based imports.
+pub fn import_source_bytes(
+    dir: &Path,
+    bytes: &[u8],
+    destination: &Path,
+) -> Result<PathBuf, StoreError> {
+    let relative = checked_source_path(destination)?;
+    let target = dir.join(&relative);
+    let parent = target.parent().ok_or_else(|| {
+        StoreError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source destination has no parent",
+        ))
+    })?;
+    ensure_destination_parent(dir, parent)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)?;
+    if let Err(error) = output.write_all(bytes) {
+        drop(output);
+        let _ = fs::remove_file(&target);
+        return Err(StoreError::Io(error));
+    }
+    output.sync_all()?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(relative)
+}
+
+/// Stream an uploaded source into a new contained file without buffering it in memory.
+/// The caller can bound the reader and reject/remove an oversized result.
+pub fn import_source_reader(
+    dir: &Path,
+    mut reader: impl Read,
+    destination: &Path,
+) -> Result<(PathBuf, u64), StoreError> {
+    let relative = checked_source_path(destination)?;
+    let target = dir.join(&relative);
+    let parent = target.parent().ok_or_else(|| {
+        StoreError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source destination has no parent",
+        ))
+    })?;
+    ensure_destination_parent(dir, parent)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)?;
+    let result = (|| {
+        let size = io::copy(&mut reader, &mut output)?;
+        output.sync_all()?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok::<u64, io::Error>(size)
+    })();
+    match result {
+        Ok(size) => Ok((relative, size)),
+        Err(error) => {
+            drop(output);
+            let _ = fs::remove_file(target);
+            Err(StoreError::Io(error))
+        }
+    }
+}
+
 pub fn check_refs(dir: &Path, project: &Project) -> Result<Vec<MissingRef>, StoreError> {
     let mut missing = Vec::new();
     for scene in &project.scenes {
         for shot in &scene.shots {
             check_target_refs(dir, &shot.refs, format!("shot:{}", shot.id), &mut missing)?;
+            if let Some(movie) = &shot.source_movie {
+                check_target_refs(
+                    dir,
+                    std::slice::from_ref(&movie.src),
+                    format!("shot:{}", shot.id),
+                    &mut missing,
+                )?;
+            }
+            if let Some(audio) = &shot.source_audio {
+                check_target_refs(
+                    dir,
+                    std::slice::from_ref(&audio.src),
+                    format!("shot:{}", shot.id),
+                    &mut missing,
+                )?;
+            }
             for take in &shot.takes {
                 check_target_refs(
                     dir,
                     &take.refs,
                     format!("take:{}/{}", shot.id, take.id),
+                    &mut missing,
+                )?;
+                for panel in &take.panels {
+                    for layer in &panel.layers {
+                        if layer.layer_type == "image"
+                            && let Some(source) = &layer.src
+                        {
+                            check_target_refs(
+                                dir,
+                                std::slice::from_ref(source),
+                                format!("layer:{}/{}/{}/{}", shot.id, take.id, panel.id, layer.id),
+                                &mut missing,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for cut in &project.cuts {
+        for clip in &cut.clips {
+            if let Some(audio) = &clip.source_audio {
+                check_target_refs(
+                    dir,
+                    std::slice::from_ref(&audio.src),
+                    format!("clip:{}/{}", cut.id, clip.id),
                     &mut missing,
                 )?;
             }
@@ -190,7 +298,16 @@ fn uses_for(project: &Project, path: &str) -> Vec<SourceUse> {
     let mut uses = Vec::new();
     for scene in &project.scenes {
         for shot in &scene.shots {
-            if shot.refs.iter().any(|reference| reference == path) {
+            if shot.refs.iter().any(|reference| reference == path)
+                || shot
+                    .source_movie
+                    .as_ref()
+                    .is_some_and(|movie| movie.src == path)
+                || shot
+                    .source_audio
+                    .as_ref()
+                    .is_some_and(|audio| audio.src == path)
+            {
                 uses.push(SourceUse {
                     target: format!("shot:{}", shot.id),
                 });
@@ -201,6 +318,31 @@ fn uses_for(project: &Project, path: &str) -> Vec<SourceUse> {
                         target: format!("take:{}/{}", shot.id, take.id),
                     });
                 }
+                for panel in &take.panels {
+                    for layer in &panel.layers {
+                        if layer.layer_type == "image" && layer.src.as_deref() == Some(path) {
+                            uses.push(SourceUse {
+                                target: format!(
+                                    "layer:{}/{}/{}/{}",
+                                    shot.id, take.id, panel.id, layer.id
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for cut in &project.cuts {
+        for clip in &cut.clips {
+            if clip
+                .source_audio
+                .as_ref()
+                .is_some_and(|audio| audio.src == path)
+            {
+                uses.push(SourceUse {
+                    target: format!("clip:{}/{}", cut.id, clip.id),
+                });
             }
         }
     }
