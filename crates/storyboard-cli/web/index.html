@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Storyboard</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/css/tokens.css">
+<link rel="stylesheet" href="/css/base.css">
+<link rel="stylesheet" href="/css/toolbar.css">
+<link rel="stylesheet" href="/css/player.css">
+<link rel="stylesheet" href="/css/graph.css">
+<link rel="stylesheet" href="/css/stickies.css">
+<link rel="stylesheet" href="/css/inspector.css">
+<link rel="stylesheet" href="/css/status.css">
+<link rel="stylesheet" href="/css/popover.css">
+<link rel="stylesheet" href="/css/switcher.css">
+<link rel="stylesheet" href="/css/keymap.css">
+<link rel="stylesheet" href="/css/overrides.css">
+</head>
+<body>
+<!-- Regions are fixed; js/main.js mounts the registered panels into them (js/core/registry.js). -->
+<div id="app" class="app">
+  <header class="toolbar" role="toolbar" aria-label="Project" data-region="toolbar"></header>
+  <div class="slot" data-region="banner"></div>
+  <main id="panel-shell" class="main panel-shell">
+    <aside class="dock-stack dock-left" data-dock="left" aria-label="Left panel dock"></aside>
+    <section id="graph" class="graph workbench-panel" tabindex="0" aria-label="Shot graph" data-region="graph"></section>
+    <div id="inspector-resizer" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize inspector" tabindex="0"></div>
+    <aside id="inspector" class="inspector workbench-panel" aria-label="Inspector" data-region="inspector"></aside>
+    <aside class="dock-stack dock-right" data-dock="right" aria-label="Right panel dock"></aside>
+    <section class="dock-stack dock-bottom" data-dock="bottom" aria-label="Bottom panel dock"></section>
+    <div class="panel-drop-preview" hidden aria-hidden="true"></div>
+  </main>
+  <footer class="statusbar" data-region="status"></footer>
+  <div class="slot" data-region="overlay"></div>
+</div>
+<script type="module" src="/js/main.js"></script>
+</body>
+</html>

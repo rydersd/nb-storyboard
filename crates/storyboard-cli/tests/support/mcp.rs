@@ -24,8 +24,25 @@ impl Mcp {
         client_name: &str,
         current_dir: Option<&std::path::Path>,
     ) -> Self {
+        Self::start_with_mode(workspace, client_name, current_dir, false)
+    }
+
+    #[allow(dead_code)] // This shared harness is also compiled by MCP test targets without job tests.
+    pub fn start_single_project(project: &std::path::Path, client_name: &str) -> Self {
+        Self::start_with_mode(project, client_name, Some(project), true)
+    }
+
+    fn start_with_mode(
+        workspace: &std::path::Path,
+        client_name: &str,
+        current_dir: Option<&std::path::Path>,
+        single_project: bool,
+    ) -> Self {
         let mut command = Command::new(cargo_bin("storyboard"));
         command.args(["mcp", workspace.to_str().expect("UTF-8 workspace")]);
+        if single_project {
+            command.env("NB_STORYBOARD_MCP_SINGLE_PROJECT", "1");
+        }
         if let Some(current_dir) = current_dir {
             command.current_dir(current_dir);
         }

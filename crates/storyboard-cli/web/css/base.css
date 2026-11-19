@@ -1,0 +1,77 @@
+/* Reset, focus, the app column, buttons, and the containers panels mount into. */
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--canvas); color: var(--text); }
+body { font: var(--fs-m)/1.4 var(--sans); -webkit-font-smoothing: antialiased; overflow: hidden; }
+button, input, textarea, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+[hidden] { display: none !important; }
+.mono, .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+:focus { outline: none; }
+:focus-visible { outline: 2px solid var(--select); outline-offset: 2px; }
+
+.app { display: flex; flex-direction: column; height: 100vh; }
+.app > .toolbar { flex: none; height: 40px; }
+.app > .main { flex: 1 1 auto; }
+.app > .statusbar { flex: none; height: 24px; }
+
+/* S19 docking shell. Docks are flex children, while pointer motion only updates a transform on
+   the drop preview; the final size/layout write happens on release. */
+.main.panel-shell { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; grid-template-rows: minmax(0, 1fr) auto; overflow: hidden; }
+.panel-shell > .graph { grid-column: 2; grid-row: 1; min-width: 0; }
+.panel-shell > .inspector { grid-column: 3; grid-row: 1; min-width: 0; }
+.dock-stack { display: none; min-width: 0; min-height: 0; overflow: auto; background: var(--surface); }
+.dock-stack:not(:empty) { display: flex; flex-direction: column; border-color: var(--border); }
+.dock-left { grid-column: 1; grid-row: 1; width: var(--dock-left, 0px); border-right: 1px solid var(--border); }
+.dock-right { grid-column: 4; grid-row: 1; width: var(--dock-right, 0px); border-left: 1px solid var(--border); }
+.dock-bottom { grid-column: 1 / -1; grid-row: 2; height: var(--dock-bottom, 0px); border-top: 1px solid var(--border); }
+.workbench-panel { min-height: 0; }
+/* A docked inspector fills its dock instead of keeping its free-standing min-width, so nothing clips or
+   hides under the dock's scrollbar; its own .insp-scroll does the scrolling. */
+.dock-stack > .inspector { flex: 1 1 auto; width: auto !important; min-width: 0; max-width: none; }
+/* The dock splitter sizes a docked inspector; the pre-S19 inspector resizer would only write an inline
+   width the dock overrides, so it is not shown inside the shell. */
+.panel-shell > #inspector-resizer { display: none; }
+.workbench-panel[data-panel-hidden="true"] { display: none; }
+.dock-panel { flex: 0 0 auto; min-height: 0; border-bottom: 1px solid var(--border); }
+.dock-tab { display: flex; align-items: center; min-height: 28px; padding: 0 8px; gap: 7px; cursor: grab; user-select: none; border-bottom: 1px solid var(--border); color: var(--text-dim); font-size: var(--fs-s); font-weight: 600; }
+.dock-tab:active { cursor: grabbing; }
+.dock-tab::before { content: "⠿"; color: var(--text-faint); font-size: 13px; }
+.graph > .dock-tab { position: relative; z-index: 2; }
+.dock-content { min-height: 30px; padding: 4px; }
+.dock-resizer { flex: none; min-height: 10px; cursor: ns-resize; border: 0; background: transparent; }
+/* Side splitters are absolutely placed on their own dock's edge, so the dock is their containing block. */
+.dock-left, .dock-right { position: relative; }
+.dock-left > .dock-resizer, .dock-right > .dock-resizer { position: absolute; top: 0; bottom: 0; width: 8px; min-height: 0; cursor: ew-resize; }
+.dock-left > .dock-resizer { right: -4px; } .dock-right > .dock-resizer { left: -4px; }
+.dock-bottom > .dock-resizer { order: -1; margin-top: -5px; }
+.panel-drop-preview { position: absolute; z-index: 50; pointer-events: none; border: 2px solid var(--select); background: color-mix(in srgb, var(--select) 16%, transparent); border-radius: var(--r-node); will-change: transform, width, height; }
+.panel-shell.dragging-panel { user-select: none; }
+
+/* ---------------------------------------------------------------- buttons */
+.btn {
+  height: 26px; padding: 0 10px; border-radius: var(--r-node); background: var(--surface-2); border: 1px solid var(--border);
+  white-space: nowrap; display: inline-flex; align-items: center; gap: 6px;
+}
+.btn:hover { border-color: var(--border-strong); }
+.btn.primary { background: var(--select); color: #161616; border-color: var(--select); font-weight: 600; }
+.btn.small { height: 22px; padding: 0 8px; font-size: var(--fs-s); }
+.btn:disabled { opacity: 0.45; cursor: default; }
+.icon-button {
+  width: 22px; height: 22px; border-radius: var(--r-node); border: 1px solid var(--border); background: transparent;
+  display: inline-grid; place-items: center; color: var(--text-dim); padding: 0; flex: none;
+}
+.icon-button:hover { color: var(--text); border-color: var(--border-strong); }
+.icon-button svg { width: 12px; height: 12px; }
+.link-button { background: none; border: 0; padding: 0; color: var(--text-dim); text-decoration: underline; text-underline-offset: 2px; font-size: var(--fs-s); }
+.link-button:hover { color: var(--text); }
+
+
+/* panels and inspector sections mount into slots that take no space of their own */
+.slot, .section-slot { display: contents; }
+.panel-error {
+  margin: 8px; padding: 6px 10px; border-left: 3px solid var(--status-changes); background: rgba(224, 100, 90, 0.12);
+  color: var(--text); font-size: var(--fs-s); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.badge-error { color: var(--status-changes); font-weight: 600; }

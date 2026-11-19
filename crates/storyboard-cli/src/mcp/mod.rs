@@ -17,14 +17,20 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     args::*,
+    commands, movie_export, movie_import,
     ops_api::{self, ApiError},
 };
 
 const AGREEMENT: &str = "Read with show, notes, history, and schema before changing a project. Writes use the base_version returned by a read or write; send small edits and then read the result. Stickies are the shared note channel: use note, reply, and resolve; an agent can only create stickies under its own client identity.";
-const TOOLS: [(&str, &str); 40] = [
+const TOOLS: [(&str, &str); 45] = [
     ("new", "Create an empty storyboard project."),
+    ("index", "List projects in this workspace."),
     ("add_scene", "Add a scene to a project."),
     ("add_shot", "Add a shot with its first take and panel."),
+    (
+        "import_shot",
+        "Import numbered image files as one timed shot.",
+    ),
     ("remove_scene", "Remove a scene."),
     ("remove_shot", "Remove a shot."),
     ("add_panel", "Add a panel to a take."),
@@ -44,6 +50,10 @@ const TOOLS: [(&str, &str); 40] = [
     ("reorder_clip", "Reorder a clip within a cut."),
     ("set_active_cut", "Choose the active cut or story order."),
     ("set_shot", "Update shot story fields."),
+    (
+        "replace_movie",
+        "Probe and attach a generated MP4 to a shot through an undoable edit.",
+    ),
     ("move_shot_to_scene", "Move a shot into a scene."),
     ("reorder_shot", "Reorder a shot within its scene."),
     ("add_ref", "Attach a source reference to a shot or take."),
@@ -54,6 +64,7 @@ const TOOLS: [(&str, &str); 40] = [
     ("select_take", "Choose a shot take."),
     ("trim", "Set a clip trim or slot."),
     ("undo", "Undo this author's recent commits."),
+    ("redo", "Redo this author's recently undone commits."),
     ("history", "Read project history."),
     ("show", "Read the active sequence."),
     (
@@ -62,6 +73,10 @@ const TOOLS: [(&str, &str); 40] = [
     ),
     ("panel_image", "Render one panel as an image."),
     ("cut_sheet", "Render a sequence contact sheet."),
+    (
+        "export_movie",
+        "Render a cut as an H.264/AAC MP4 from source video or storyboard panels.",
+    ),
     ("note", "Add a sticky note."),
     ("reply", "Reply to a sticky note."),
     ("resolve", "Resolve a sticky note."),
@@ -88,8 +103,10 @@ struct ApplyArgs {
 fn input_schema(name: &str) -> Value {
     match name {
         "new" => schema_for_args::<NewArgs>(name, false),
+        "index" => schema_for_args::<IndexArgs>(name, false),
         "add_scene" => schema_for_args::<AddSceneArgs>(name, true),
         "add_shot" => schema_for_args::<AddShotArgs>(name, true),
+        "import_shot" => schema_for_args::<ImportShotArgs>(name, true),
         "remove_scene" => schema_for_args::<RemoveSceneArgs>(name, true),
         "remove_shot" => schema_for_args::<RemoveShotArgs>(name, true),
         "add_panel" => schema_for_args::<AddPanelArgs>(name, true),
@@ -109,17 +126,20 @@ fn input_schema(name: &str) -> Value {
         "reorder_clip" => schema_for_args::<ReorderClipArgs>(name, true),
         "set_active_cut" => schema_for_args::<SetActiveCutArgs>(name, true),
         "set_shot" => schema_for_args::<SetShotArgs>(name, true),
+        "replace_movie" => schema_for_args::<ReplaceMovieArgs>(name, true),
         "move_shot_to_scene" => schema_for_args::<MoveShotToSceneArgs>(name, true),
         "reorder_shot" => schema_for_args::<ReorderShotArgs>(name, true),
         "add_ref" | "remove_ref" => schema_for_args::<RefArgs>(name, true),
         "select_take" => schema_for_args::<SelectTakeArgs>(name, true),
         "trim" => schema_for_args::<TrimArgs>(name, true),
         "undo" => schema_for_args::<UndoArgs>(name, true),
+        "redo" => schema_for_args::<RedoArgs>(name, true),
         "history" => schema_for_args::<HistoryArgs>(name, false),
         "show" => schema_for_args::<ShowArgs>(name, false),
         "describe" => schema_for_args::<DescribeArgs>(name, false),
         "panel_image" => schema_for_args::<PanelImageArgs>(name, false),
         "cut_sheet" => schema_for_args::<CutSheetArgs>(name, false),
+        "export_movie" => schema_for_args::<ExportMovieArgs>(name, false),
         "note" => schema_for_args::<NoteArgs>(name, true),
         "reply" => schema_for_args::<ReplyArgs>(name, true),
         "resolve" => schema_for_args::<ResolveArgs>(name, true),
@@ -260,7 +280,7 @@ pub fn run(workspace: &Path) -> Result<(), ApiError> {
             }
             "notifications/initialized" | "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({
-                "tools": TOOLS.into_iter().map(|(name, description)| {
+                "tools": TOOLS.into_iter().filter(|(name, _)| !single_project_mode() || *name != "new").map(|(name, description)| {
                     json!({"name":name,"description":description,"inputSchema":input_schema(name)})
                 }).collect::<Vec<_>>()
             })),
@@ -349,6 +369,7 @@ fn dispatch(
                 number(input, "height", 900)?,
             )
         }
+        "index" => commands::workspace_index(workspace),
         "add_scene" => write(
             workspace,
             input,
@@ -370,6 +391,28 @@ fn dispatch(
                 index: opt_num(input, "index")?,
             },
         ),
+        "import_shot" => {
+            let images: Vec<PathBuf> = serde_json::from_value(
+                input
+                    .get("images")
+                    .cloned()
+                    .ok_or_else(|| ops_api::validation("images are required"))?,
+            )
+            .map_err(|_| ops_api::validation("images must be file paths"))?;
+            commands::run(Command::ImportShot(ImportShotArgs {
+                write: WriteArgs {
+                    dir: project(workspace, input)?,
+                    base_version: required(input, "base_version")?.into(),
+                    author: Some(format!("agent:{client}")),
+                    note: opt(input, "note"),
+                },
+                scene: required(input, "scene")?.into(),
+                title: required(input, "title")?.into(),
+                duration: opt_num(input, "duration")?,
+                index: opt_num(input, "index")?,
+                images,
+            }))
+        }
         "remove_scene" => write(
             workspace,
             input,
@@ -460,6 +503,14 @@ fn dispatch(
             ops_api::set_active_cut_op(opt(input, "cut"), boolean(input, "story", false)?)?,
         ),
         "set_shot" => set_shot(workspace, input, client),
+        "replace_movie" => movie_import::replace_movie(
+            &project(workspace, input)?,
+            required(input, "base_version")?,
+            required(input, "shot")?,
+            &path(input, "source")?,
+            agent(client)?,
+            opt(input, "note"),
+        ),
         "move_shot_to_scene" => write(
             workspace,
             input,
@@ -515,6 +566,15 @@ fn dispatch(
                 number(input, "steps", 1)?,
             )
         }
+        "redo" => {
+            let dir = project(workspace, input)?;
+            ops_api::redo_ops(
+                &dir,
+                required(input, "base_version")?,
+                agent(client)?,
+                number(input, "steps", 1)?,
+            )
+        }
         "history" => ops_api::history_result(
             &project(workspace, input)?,
             number(input, "limit", 20)?,
@@ -540,6 +600,11 @@ fn dispatch(
                 out: path(input, "out")?,
             },
             workspace,
+        ),
+        "export_movie" => movie_export::export(
+            &project(workspace, input)?,
+            opt_ref(input, "cut"),
+            movie_export::ImageMode::parse(opt_ref(input, "mode").unwrap_or("original"))?,
         ),
         "note" => write(
             workspace,
@@ -616,6 +681,7 @@ fn is_write_tool(name: &str) -> bool {
         name,
         "add_scene"
             | "add_shot"
+            | "import_shot"
             | "remove_scene"
             | "remove_shot"
             | "add_panel"
@@ -633,6 +699,7 @@ fn is_write_tool(name: &str) -> bool {
             | "reorder_clip"
             | "set_active_cut"
             | "set_shot"
+            | "replace_movie"
             | "move_shot_to_scene"
             | "reorder_shot"
             | "add_ref"
@@ -640,6 +707,7 @@ fn is_write_tool(name: &str) -> bool {
             | "select_take"
             | "trim"
             | "undo"
+            | "redo"
             | "note"
             | "reply"
             | "resolve"
@@ -876,12 +944,25 @@ fn render_panel(
 }
 fn project(workspace: &Path, input: &Map<String, Value>) -> Result<PathBuf, ApiError> {
     let requested = path(input, "project")?;
-    let path = if requested.is_absolute() {
+    let path = if single_project_mode() && !requested.is_absolute() {
+        if requested == Path::new(".")
+            || workspace
+                .file_name()
+                .is_some_and(|name| requested == Path::new(name))
+        {
+            workspace.to_path_buf()
+        } else {
+            return Err(ops_api::validation("Claude can edit only the open project"));
+        }
+    } else if requested.is_absolute() {
         requested
     } else {
         workspace.join(requested)
     };
     let path = path.canonicalize().map_err(|e| ApiError::Store(e.into()))?;
+    if single_project_mode() && path != workspace {
+        return Err(ops_api::validation("Claude can edit only the open project"));
+    }
     if path.starts_with(workspace) {
         Ok(path)
     } else {
@@ -891,6 +972,11 @@ fn project(workspace: &Path, input: &Map<String, Value>) -> Result<PathBuf, ApiE
     }
 }
 fn project_destination(workspace: &Path, requested: PathBuf) -> Result<PathBuf, ApiError> {
+    if single_project_mode() {
+        return Err(ops_api::validation(
+            "Claude cannot create another project in this run",
+        ));
+    }
     if requested
         .components()
         .any(|component| component == Component::ParentDir)
@@ -929,6 +1015,9 @@ fn project_destination(workspace: &Path, requested: PathBuf) -> Result<PathBuf, 
         ));
     }
     Ok(path)
+}
+fn single_project_mode() -> bool {
+    std::env::var_os("NB_STORYBOARD_MCP_SINGLE_PROJECT").is_some_and(|value| value == "1")
 }
 fn nearest_existing_ancestor(path: &Path) -> Result<&Path, ApiError> {
     path.ancestors()

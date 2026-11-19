@@ -1,11 +1,13 @@
 use serde_json::{Value, json};
 use storyboard_core::{ClipSource, CutSource, Op, ShotSource};
-use storyboard_store::import_source;
+use storyboard_store::{import_source, index, open_workspace};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     args::*,
+    movie_export, movie_import,
     ops_api::{self, ApiError},
+    sequence_import,
 };
 
 pub fn run(command: Command) -> Result<Value, ApiError> {
@@ -13,7 +15,16 @@ pub fn run(command: Command) -> Result<Value, ApiError> {
         Command::Mcp(_) => Err(ops_api::validation(
             "MCP must run through the stdio entry point",
         )),
+        Command::Serve(_) => Err(ops_api::validation(
+            "serve must run through its own entry point",
+        )),
+        Command::ExportMovie(a) => movie_export::export(
+            &a.dir,
+            a.cut.as_deref(),
+            movie_export::ImageMode::parse(&a.mode)?,
+        ),
         Command::New(a) => ops_api::create_project(&a.dir, &a.title, a.fps, a.width, a.height),
+        Command::Index(a) => workspace_index(&a.workspace),
         Command::AddScene(a) => write(
             &a.write,
             Op::AddScene {
@@ -31,6 +42,72 @@ pub fn run(command: Command) -> Result<Value, ApiError> {
                 index: a.index,
             },
         ),
+        Command::ImportShot(a) => {
+            let author = ops_api::author(a.write.author.clone())?;
+            let loaded = storyboard_store::open(&a.write.dir)?;
+            let mut files: Vec<_> = a
+                .images
+                .iter()
+                .map(|path| {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    (name, path.clone())
+                })
+                .collect();
+            sequence_import::sort_images(&mut files)?;
+            // Validate the whole document batch before copying source material.
+            let planned: Vec<_> = files
+                .iter()
+                .map(|(name, _)| {
+                    (
+                        name.clone(),
+                        format!("sources/imported-shots/preview/{name}"),
+                    )
+                })
+                .collect();
+            sequence_import::import_ops(
+                &loaded.project,
+                &a.scene,
+                &a.title,
+                a.duration,
+                a.index,
+                &planned,
+            )?;
+            let folder = format!(
+                "seq-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|error| ops_api::validation(error.to_string()))?
+                    .as_nanos()
+            );
+            let mut imported = Vec::new();
+            for (name, source) in files {
+                let destination = std::path::PathBuf::from("sources/imported-shots")
+                    .join(&folder)
+                    .join(&name);
+                let relative = import_source(&a.write.dir, &source, &destination)?;
+                imported.push((name, relative.to_string_lossy().replace('\\', "/")));
+            }
+            let ops = sequence_import::import_ops(
+                &loaded.project,
+                &a.scene,
+                &a.title,
+                a.duration,
+                a.index,
+                &imported,
+            )?;
+            ops_api::commit_ops(
+                &a.write.dir,
+                &a.write.base_version,
+                ops,
+                author,
+                a.write.note,
+            )
+        }
         Command::RemoveScene(a) => write(&a.write, ops_api::remove_scene_op(a.scene)),
         Command::RemoveShot(a) => write(&a.write, ops_api::remove_shot_op(a.shot)),
         Command::AddPanel(a) => {
@@ -176,6 +253,14 @@ pub fn run(command: Command) -> Result<Value, ApiError> {
             )?;
             write(&a.write, op)
         }
+        Command::ReplaceMovie(a) => movie_import::replace_movie(
+            &a.write.dir,
+            &a.write.base_version,
+            &a.shot,
+            &a.source,
+            ops_api::author(a.write.author)?,
+            a.write.note,
+        ),
         Command::MoveShotToScene(a) => write(
             &a.write,
             ops_api::move_shot_to_scene_op(a.shot, a.scene, a.index),
@@ -206,6 +291,12 @@ pub fn run(command: Command) -> Result<Value, ApiError> {
             write(&a.write, op)
         }
         Command::Undo(a) => ops_api::undo_ops(
+            &a.write.dir,
+            &a.write.base_version,
+            ops_api::author(a.write.author)?,
+            a.steps,
+        ),
+        Command::Redo(a) => ops_api::redo_ops(
             &a.write.dir,
             &a.write.base_version,
             ops_api::author(a.write.author)?,
@@ -250,6 +341,10 @@ pub fn run(command: Command) -> Result<Value, ApiError> {
         ),
         Command::Schema(a) => ops_api::schema(a.op.as_deref()),
     }
+}
+
+pub(crate) fn workspace_index(root: &std::path::Path) -> Result<Value, ApiError> {
+    Ok(json!({"projects": index(&open_workspace(root)?)?}))
 }
 
 fn write(write: &WriteArgs, op: Op) -> Result<Value, ApiError> {

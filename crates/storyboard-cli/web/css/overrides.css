@@ -1,0 +1,10 @@
+/* Reduced motion and narrow windows. Loaded last. */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition: none !important; }
+  .node.remote::after { animation: none; opacity: 1; }
+}
+@media (max-width: 900px) {
+  .inspector { min-width: 280px; }
+  .graph { min-width: 40%; }
+}

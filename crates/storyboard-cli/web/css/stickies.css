@@ -1,0 +1,40 @@
+/* Stickies on the canvas and threads in the inspector. */
+
+/* ---------------------------------------------------------------- stickies on canvas */
+.sticky-card {
+  position: absolute; left: 0; top: 0; width: 200px; background: var(--sticky); color: var(--sticky-text);
+  border-radius: var(--r-node); padding: 9px 10px 8px; border-top: 3px solid var(--agent); cursor: default;
+}
+.sticky-card.by-human { border-top-color: var(--human); }
+.sticky-card.selected { box-shadow: 0 0 0 2px var(--select); }
+.sticky-card.dragging { opacity: 0.9; z-index: 6; }
+.sticky-card.draft { border-top-color: var(--human); }
+.sticky-text { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; }
+.sticky-meta { display: flex; gap: 8px; margin-top: 6px; font-size: var(--fs-s); color: var(--text-dim); }
+.sticky-author.agent { color: var(--agent); }
+.sticky-author.human { color: var(--human); }
+.kind { font-family: var(--mono); color: var(--text-dim); margin-right: 4px; }
+.sticky-card textarea {
+  width: 100%; min-height: 64px; resize: none; border: 0; background: transparent; color: var(--sticky-text);
+  padding: 0; line-height: 1.4;
+}
+.sticky-card .draft-help { font-size: var(--fs-s); color: var(--text-dim); margin-top: 4px; }
+
+.new-sticky { display: grid; gap: 6px; margin-bottom: 10px; }
+.new-sticky .row { display: flex; gap: 6px; align-items: center; }
+.new-sticky textarea, .reply-input, .new-sticky select {
+  width: 100%; background: var(--canvas); border: 1px solid var(--border); border-radius: var(--r-node); padding: 4px 7px; resize: none;
+}
+.new-sticky select { width: auto; height: 24px; padding: 0 4px; font-size: var(--fs-s); }
+.thread { padding: 8px 0; border-top: 1px solid var(--border); }
+.thread:first-of-type { border-top: 0; }
+.thread.resolved { opacity: 0.6; }
+.thread-group { font-size: var(--fs-s); color: var(--text-faint); margin-bottom: 2px; }
+.t-item { display: grid; gap: 2px; }
+.t-item + .t-item { margin-top: 6px; padding-left: 12px; border-left: 2px solid var(--border); }
+.t-meta { display: flex; gap: 8px; font-size: var(--fs-s); color: var(--text-faint); align-items: baseline; }
+.t-meta .who { font-weight: 600; }
+.t-meta .who.agent { color: var(--agent); } .t-meta .who.human { color: var(--human); }
+.t-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.t-actions { display: flex; gap: 10px; margin-top: 4px; align-items: center; }
+.reply-input { margin-top: 6px; min-height: 26px; }

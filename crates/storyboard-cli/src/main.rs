@@ -15,6 +15,18 @@ fn main() {
                 }
                 return;
             }
+            if let storyboard_cli::args::Command::Serve(args) = cli.command {
+                let options = storyboard_cli::serve::ServeOptions {
+                    workspace: args.workspace,
+                    port: args.port,
+                    open_browser: !args.no_open,
+                };
+                if let Err(error) = storyboard_cli::serve::run(options) {
+                    let _ = writeln!(std::io::stderr(), "{}", ops_api::map_error(error));
+                    std::process::exit(1);
+                }
+                return;
+            }
             let is_show = matches!(cli.command, storyboard_cli::args::Command::Show(_));
             match commands::run(cli.command) {
                 Ok(value) => print(value, pretty, is_show, 0),
@@ -84,6 +96,7 @@ fn write_verb_is_missing_base_version() -> bool {
                     | "reorder-clip"
                     | "set-active-cut"
                     | "set-shot"
+                    | "replace-movie"
                     | "move-shot"
                     | "move-shot-to-scene"
                     | "reorder-shot"
@@ -92,6 +105,7 @@ fn write_verb_is_missing_base_version() -> bool {
                     | "select-take"
                     | "trim"
                     | "undo"
+                    | "redo"
                     | "note"
                     | "reply"
                     | "resolve"

@@ -1,0 +1,8 @@
+/* Keyboard list. */
+
+.keymap { width: min(560px, 92vw); max-height: 80vh; overflow-y: auto; padding: 14px 16px; }
+.keymap h2 { margin: 0 0 10px; font-size: var(--fs-l); }
+.keymap table { border-collapse: collapse; width: 100%; }
+.keymap td { padding: 3px 0; vertical-align: top; }
+.keymap td:first-child { font-family: var(--mono); color: var(--text); padding-right: 18px; white-space: nowrap; font-size: var(--fs-s); }
+.keymap td:last-child { color: var(--text-dim); }

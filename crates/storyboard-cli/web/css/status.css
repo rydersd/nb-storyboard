@@ -1,0 +1,38 @@
+/* Status bar and toasts. */
+
+/* ---------------------------------------------------------------- status bar */
+.statusbar {
+  display: flex; align-items: center; gap: 12px; padding: 0 8px; background: var(--surface); border-top: 1px solid var(--border);
+  font-size: var(--fs-s); color: var(--text-dim); min-width: 0;
+}
+.status-left {
+  flex: 1; min-width: 0; text-align: left; background: none; border: 0; padding: 0; color: inherit;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: default;
+}
+.status-left.clickable { cursor: pointer; }
+.status-left.clickable:hover { color: var(--text); }
+.status-left .who { color: var(--agent); font-weight: 600; }
+.status-left .who.human { color: var(--human); }
+.status-left.error { color: var(--status-changes); }
+.status-hint { white-space: nowrap; }
+.status-zoom {
+  font-family: var(--mono); font-variant-numeric: tabular-nums; min-width: 4ch; text-align: right;
+  background: none; border: 0; padding: 0; color: inherit; cursor: pointer;
+}
+.status-zoom:hover { color: var(--text); }
+.statusbar .icon-button { width: 18px; height: 18px; font-size: var(--fs-s); }
+
+/* ---------------------------------------------------------------- toasts */
+.toasts { position: fixed; left: 12px; bottom: 32px; display: grid; gap: 8px; z-index: 50; width: min(380px, 90vw); }
+.toast {
+  background: var(--surface-2); border: 1px solid var(--border-strong); border-left: 3px solid var(--status-changes);
+  border-radius: var(--r-node); padding: 8px 10px; box-shadow: var(--pop-shadow); display: grid; gap: 4px;
+}
+.toast.conflict { border-left-color: var(--conflict); }
+.toast .t-head { display: flex; gap: 8px; align-items: start; }
+.toast .t-msg { flex: 1; color: var(--text); }
+.toast .t-hint { color: var(--text-dim); font-size: var(--fs-s); }
+.toast .t-valid { font-size: var(--fs-s); color: var(--text-dim); }
+.toast .t-valid code { font-family: var(--mono); color: var(--text); background: var(--canvas); padding: 0 4px; border-radius: 3px; margin-right: 4px; }
+.toast ul { margin: 0; padding-left: 16px; font-size: var(--fs-s); color: var(--text-dim); }
+.toast .row { display: flex; gap: 6px; margin-top: 4px; }

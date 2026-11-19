@@ -47,6 +47,13 @@ fn new_project() -> (TempDir, std::path::PathBuf, String) {
     (workspace, dir, version)
 }
 
+#[test]
+fn cli_workspace_index_includes_fps() {
+    let (workspace, _dir, _version) = new_project();
+    let indexed = json(storyboard().args(["index", workspace.path().to_str().expect("UTF-8")]));
+    assert_eq!(indexed["projects"][0]["fps"], 24);
+}
+
 fn write(dir: &Path, version: &str, args: &[&str]) -> Value {
     let mut command = storyboard();
     command
@@ -84,6 +91,71 @@ fn write_png(path: &Path) {
 fn assert_png(path: &Path) {
     let bytes = fs::read(path).expect("PNG output");
     assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+}
+
+#[test]
+fn imports_numbered_images_as_one_ordered_undoable_shot() {
+    let (workspace, dir, base) = new_project();
+    let base = write_version(&dir, &base, &["add-scene", "--title", "Opening"]);
+    let files: Vec<_> = ["frame-10.png", "frame-2.png", "frame-1.png"]
+        .into_iter()
+        .map(|name| workspace.path().join(name))
+        .collect();
+    for file in &files {
+        write_png(file);
+    }
+    let mut command = storyboard();
+    command.args([
+        "import-shot",
+        dir.to_str().unwrap(),
+        "--base-version",
+        &base,
+        "--author",
+        "human",
+        "--scene",
+        "scene-1",
+        "--title",
+        "Sequence",
+    ]);
+    for file in &files {
+        command.arg(file);
+    }
+    let result = json(&mut command);
+    let document: Value =
+        serde_json::from_slice(&fs::read(dir.join("project.json")).unwrap()).unwrap();
+    let shot = &document["scenes"][0]["shots"][0];
+    assert_eq!(shot["title"], "Sequence");
+    assert_eq!(shot["duration"], 3.0);
+    let panels = shot["takes"][0]["panels"].as_array().unwrap();
+    assert_eq!(panels.len(), 3);
+    assert_eq!(
+        panels
+            .iter()
+            .map(|p| p["time"].as_f64().unwrap())
+            .collect::<Vec<_>>(),
+        [0.0, 1.0, 2.0]
+    );
+    let names: Vec<_> = panels
+        .iter()
+        .map(|panel| {
+            panel["layers"][0]["src"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(names, ["frame-1.png", "frame-2.png", "frame-10.png"]);
+    let undone = write(&dir, result["version"].as_str().unwrap(), &["undo"]);
+    assert!(undone["version"].is_string());
+    let document: Value =
+        serde_json::from_slice(&fs::read(dir.join("project.json")).unwrap()).unwrap();
+    assert!(
+        document["scenes"][0]["shots"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
 }
 
 fn assert_refuses_without_overwrite(command: &mut Command, project: &Path) {
@@ -480,6 +552,26 @@ fn cli_undo_reverts_a_write() {
     assert!(undone["version"].is_string());
     let shown = json(storyboard().args(["show", dir.to_str().expect("UTF-8 path")]));
     assert!(shown["shots"].as_array().expect("shots").is_empty());
+}
+
+#[test]
+fn cli_redo_reapplies_an_undone_write() {
+    let (_workspace, dir, version) = new_project();
+    let version = add_opening_shot(&dir, &version);
+    let undone = write(&dir, &version, &["undo"]);
+    let redone = write(
+        &dir,
+        undone["version"].as_str().expect("undo version"),
+        &["redo"],
+    );
+    assert!(
+        redone["summary"]
+            .as_str()
+            .expect("summary")
+            .contains("redo")
+    );
+    let shown = json(storyboard().args(["show", dir.to_str().expect("UTF-8 path")]));
+    assert_eq!(shown["shots"].as_array().expect("shots").len(), 1);
 }
 
 #[test]
@@ -980,7 +1072,7 @@ fn cli_write_summaries_name_each_requested_operation() {
         add_scene["summary"]
             .as_str()
             .expect("summary")
-            .contains("add-scene")
+            .contains("added scene \u{201c}Opening\u{201d}")
     );
     version = add_scene["version"].as_str().expect("version").into();
     let add_second_scene = write(&dir, &version, &["add-scene", "--title", "Ending"]);
@@ -997,7 +1089,7 @@ fn cli_write_summaries_name_each_requested_operation() {
         add_shot["summary"]
             .as_str()
             .expect("summary")
-            .contains("add-shot")
+            .contains("added shot \u{201c}Arrival\u{201d} to \u{201c}Opening\u{201d}")
     );
     version = add_shot["version"].as_str().expect("version").into();
     let add_image = write(
@@ -1009,7 +1101,7 @@ fn cli_write_summaries_name_each_requested_operation() {
         add_image["summary"]
             .as_str()
             .expect("summary")
-            .contains("add-image")
+            .contains("added image layer to \u{201c}Arrival\u{201d}")
     );
     version = add_image["version"].as_str().expect("version").into();
     version = write_version(
@@ -1026,11 +1118,16 @@ fn cli_write_summaries_name_each_requested_operation() {
         select["summary"]
             .as_str()
             .expect("summary")
-            .contains("select-take")
+            .contains("selected take \u{201c}Alt\u{201d} for \u{201c}Arrival\u{201d}")
     );
     version = select["version"].as_str().expect("version").into();
     let note = write(&dir, &version, &["note", "--text", "Check doorway"]);
-    assert!(note["summary"].as_str().expect("summary").contains("note"));
+    assert!(
+        note["summary"]
+            .as_str()
+            .expect("summary")
+            .contains("added note")
+    );
     version = note["version"].as_str().expect("version").into();
     let sticky = note["ids"][0].as_str().expect("sticky").to_owned();
     let reply = write(
@@ -1042,7 +1139,7 @@ fn cli_write_summaries_name_each_requested_operation() {
         reply["summary"]
             .as_str()
             .expect("summary")
-            .contains("reply")
+            .contains("replied to note")
     );
     version = reply["version"].as_str().expect("version").into();
     let resolve = write(&dir, &version, &["resolve", "--sticky", &sticky]);
@@ -1050,7 +1147,7 @@ fn cli_write_summaries_name_each_requested_operation() {
         resolve["summary"]
             .as_str()
             .expect("summary")
-            .contains("resolve")
+            .contains("resolved note")
     );
     version = resolve["version"].as_str().expect("version").into();
     let moved = write(
@@ -1070,7 +1167,7 @@ fn cli_write_summaries_name_each_requested_operation() {
         moved["summary"]
             .as_str()
             .expect("summary")
-            .contains("move-shot")
+            .contains("moved \u{201c}Arrival\u{201d} to \u{201c}Ending\u{201d}")
     );
 }
 
@@ -1450,4 +1547,802 @@ fn cli_write_requires_author_or_nb_author() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("\"hint\""));
+}
+
+#[test]
+fn cli_replaces_shot_movie_from_agent_output_and_undoes_link() {
+    if Command::new("ffmpeg").arg("-version").output().is_err()
+        || Command::new("ffprobe").arg("-version").output().is_err()
+    {
+        return;
+    }
+    let (workspace, dir, version) = new_project();
+    let version = add_opening_shot(&dir, &version);
+    let movie = workspace.path().join("generated.mp4");
+    let encoded = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=160x90:r=24",
+            "-t",
+            "2",
+            "-pix_fmt",
+            "yuv420p",
+            "-y",
+        ])
+        .arg(&movie)
+        .output()
+        .expect("generate MP4 fixture");
+    assert!(
+        encoded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encoded.stderr)
+    );
+    let bad = error(storyboard().args([
+        "replace-movie",
+        dir.to_str().unwrap(),
+        "--base-version",
+        &version,
+        "--author",
+        "agent:claude",
+        "--shot",
+        "missing",
+        "--source",
+        movie.to_str().unwrap(),
+    ]));
+    assert_eq!(bad["error"]["kind"], "validation");
+    let replaced = json(storyboard().args([
+        "replace-movie",
+        dir.to_str().unwrap(),
+        "--base-version",
+        &version,
+        "--author",
+        "agent:claude",
+        "--shot",
+        "shot-1",
+        "--source",
+        movie.to_str().unwrap(),
+    ]));
+    let stored = replaced["path"].as_str().expect("project source path");
+    let folder = stored
+        .strip_prefix("sources/imported-movies/")
+        .and_then(|path| path.strip_suffix("/original.mp4"))
+        .expect("generated movie has a streamable source path");
+    assert!(uuid::Uuid::parse_str(folder).is_ok());
+    assert_eq!(
+        fs::read(&movie).unwrap(),
+        fs::read(dir.join(stored)).unwrap()
+    );
+    let shot = &storyboard_store::open(&dir).unwrap().project.scenes[0].shots[0];
+    assert_eq!(shot.source_movie.as_ref().unwrap().src, stored);
+    assert_eq!(shot.duration, 2.0);
+    let undone = json(storyboard().args([
+        "undo",
+        dir.to_str().unwrap(),
+        "--base-version",
+        replaced["version"].as_str().unwrap(),
+        "--author",
+        "agent:claude",
+    ]));
+    assert!(undone["version"].is_string());
+    assert!(
+        storyboard_store::open(&dir).unwrap().project.scenes[0].shots[0]
+            .source_movie
+            .is_none()
+    );
+    assert!(
+        dir.join(stored).is_file(),
+        "copied source remains recoverable for history"
+    );
+}
+
+#[test]
+fn cli_exports_numbered_panels_then_replacement_movie_with_audio() {
+    if Command::new("ffmpeg").arg("-version").output().is_err()
+        || Command::new("ffprobe").arg("-version").output().is_err()
+    {
+        return;
+    }
+    let workspace = TempDir::new().unwrap();
+    let dir = workspace.path().join("project");
+    let initial = json(storyboard().args([
+        "new",
+        dir.to_str().unwrap(),
+        "--title",
+        "Export",
+        "--width",
+        "320",
+        "--height",
+        "180",
+    ]));
+    let scene_version = write_version(
+        &dir,
+        initial["version"].as_str().unwrap(),
+        &["add-scene", "--title", "Scene"],
+    );
+    let red = workspace.path().join("frame-001.png");
+    let green = workspace.path().join("frame-002.png");
+    ImageBuffer::<Rgba<u8>, _>::from_pixel(320, 180, Rgba([255, 0, 0, 255]))
+        .save(&red)
+        .unwrap();
+    ImageBuffer::<Rgba<u8>, _>::from_pixel(320, 180, Rgba([0, 255, 0, 255]))
+        .save(&green)
+        .unwrap();
+    let imported = json(storyboard().args([
+        "import-shot",
+        dir.to_str().unwrap(),
+        "--base-version",
+        &scene_version,
+        "--author",
+        "human",
+        "--scene",
+        "scene-1",
+        "--title",
+        "Boards",
+        "--duration",
+        "1",
+        red.to_str().unwrap(),
+        green.to_str().unwrap(),
+    ]));
+    let second_version = write_version(
+        &dir,
+        imported["version"].as_str().unwrap(),
+        &["add-shot", "--scene", "scene-1", "--title", "Replacement"],
+    );
+    let movie = workspace.path().join("blue.mp4");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=320x180:r=24:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            "-y",
+        ])
+        .arg(&movie)
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    json(storyboard().args([
+        "replace-movie",
+        dir.to_str().unwrap(),
+        "--base-version",
+        &second_version,
+        "--author",
+        "human",
+        "--shot",
+        "shot-2",
+        "--source",
+        movie.to_str().unwrap(),
+    ]));
+    let document_before = fs::read(dir.join("project.json")).unwrap();
+    let result = json(storyboard().args(["export-movie", dir.to_str().unwrap()]));
+    let output = Path::new(result["path"].as_str().unwrap());
+    assert!(output.is_file());
+    assert_eq!(result["frames"], 48);
+    assert_eq!(
+        fs::read(dir.join("project.json")).unwrap(),
+        document_before,
+        "export must not edit the project"
+    );
+    let count = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(output)
+        .output()
+        .unwrap();
+    assert!(count.status.success());
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "48");
+    let audio = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(output)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&audio.stdout).trim(), "aac");
+    let pixel = |seconds: &str| {
+        let frame = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                seconds,
+            ])
+            .arg("-i")
+            .arg(output)
+            .args([
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=1:1",
+                "-pix_fmt",
+                "rgb24",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(frame.status.success());
+        frame.stdout
+    };
+    let first = pixel("0.25");
+    let second = pixel("0.75");
+    let third = pixel("1.25");
+    assert!(
+        first[0] > 150 && first[1] < 100 && first[2] < 100,
+        "red panel: {first:?}"
+    );
+    assert!(
+        second[1] > 150 && second[0] < 100 && second[2] < 100,
+        "green panel: {second:?}"
+    );
+    assert!(
+        third[2] > 100 && third[0] < 100 && third[1] < 100,
+        "blue movie: {third:?}"
+    );
+    let cached = json(storyboard().args(["export-movie", dir.to_str().unwrap()]));
+    assert_eq!(cached["cached"], true);
+}
+
+#[test]
+fn cli_export_holds_last_frame_while_voice_over_continues() {
+    if Command::new("ffmpeg").arg("-version").output().is_err()
+        || Command::new("ffprobe").arg("-version").output().is_err()
+    {
+        return;
+    }
+    let workspace = TempDir::new().unwrap();
+    let dir = workspace.path().join("project");
+    let initial = json(storyboard().args([
+        "new",
+        dir.to_str().unwrap(),
+        "--title",
+        "Hold",
+        "--width",
+        "320",
+        "--height",
+        "180",
+    ]));
+    let shot_version = add_opening_shot(&dir, initial["version"].as_str().unwrap());
+    let movie = workspace.path().join("movie.mp4");
+    let voice = workspace.path().join("voice.wav");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=320x180:r=120:d=1",
+            "-vf",
+            "drawbox=x=0:y=0:w=iw:h=ih:color=blue:t=fill:enable='eq(n,119)'",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-y",
+        ])
+        .arg(&movie)
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=880:sample_rate=48000:duration=2",
+            "-y",
+        ])
+        .arg(&voice)
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let replaced = json(storyboard().args([
+        "replace-movie",
+        dir.to_str().unwrap(),
+        "--base-version",
+        &shot_version,
+        "--author",
+        "human",
+        "--shot",
+        "shot-1",
+        "--source",
+        movie.to_str().unwrap(),
+    ]));
+    let relative = std::path::PathBuf::from("sources/imported-audio")
+        .join(uuid::Uuid::new_v4().to_string())
+        .join("original.wav");
+    storyboard_store::import_source(&dir, &voice, &relative).unwrap();
+    let movie_source = storyboard_store::open(&dir).unwrap().project.scenes[0].shots[0]
+        .source_movie
+        .clone()
+        .unwrap();
+    let patch: storyboard_core::Patch = serde_json::from_value(serde_json::json!({
+        "duration": 2.0,
+        "source_movie": {"src": movie_source.src, "start": 0.5, "end": 1.0},
+        "source_audio": {"src": relative.to_str().unwrap(), "start": 0.0, "end": 2.0}
+    }))
+    .unwrap();
+    storyboard_store::commit(
+        &dir,
+        replaced["version"].as_str().unwrap(),
+        vec![storyboard_core::Op::UpdateShot {
+            shot: "shot-1".into(),
+            patch,
+        }],
+        storyboard_core::Author::Human,
+        None,
+    )
+    .unwrap();
+    let result = json(storyboard().args(["export-movie", dir.to_str().unwrap()]));
+    let output = Path::new(result["path"].as_str().unwrap());
+    assert_eq!(result["frames"], 48);
+    let video_frames = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(output)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&video_frames.stdout).trim(), "48");
+    let held = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            "1.5",
+        ])
+        .arg("-i")
+        .arg(output)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=1:1",
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(held.status.success());
+    assert!(
+        held.stdout[2] > 100 && held.stdout[0] < 100 && held.stdout[1] < 100,
+        "held blue frame: {:?}",
+        held.stdout
+    );
+    let late_voice = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            "1.4",
+        ])
+        .arg("-i")
+        .arg(output)
+        .args(["-t", "0.2", "-vn", "-ac", "1", "-f", "s16le", "pipe:1"])
+        .output()
+        .unwrap();
+    assert!(late_voice.status.success());
+    assert!(
+        late_voice
+            .stdout
+            .chunks_exact(2)
+            .any(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]).unsigned_abs() > 500),
+        "voice-over should continue after the movie ends"
+    );
+
+    // Starting a placement after the movie ends must hold the actual last source frame.
+    let mut version = storyboard_store::open(&dir).unwrap().version;
+    version = write_version(&dir, &version, &["add-cut", "--name", "Late start"]);
+    version = write_version(
+        &dir,
+        &version,
+        &["add-clip", "--cut", "cut-1", "--shot", "shot-1"],
+    );
+    let _version = write_version(
+        &dir,
+        &version,
+        &[
+            "trim", "--cut", "cut-1", "--clip", "clip-1", "--in", "36", "--out", "48",
+        ],
+    );
+    let late = json(storyboard().args(["export-movie", dir.to_str().unwrap(), "--cut", "cut-1"]));
+    assert_eq!(late["frames"], 12);
+    let late_frame = Command::new("ffmpeg")
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(late["path"].as_str().unwrap())
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=1:1",
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(late_frame.status.success());
+    assert!(
+        late_frame.stdout[2] > 100 && late_frame.stdout[0] < 100 && late_frame.stdout[1] < 100,
+        "late-start held frame: {:?}",
+        late_frame.stdout
+    );
+}
+
+#[test]
+fn cli_export_uses_placement_voice_only_for_that_clip() {
+    if Command::new("ffmpeg").arg("-version").output().is_err()
+        || Command::new("ffprobe").arg("-version").output().is_err()
+    {
+        return;
+    }
+    let workspace = TempDir::new().unwrap();
+    let dir = workspace.path().join("project");
+    let initial = json(storyboard().args([
+        "new",
+        dir.to_str().unwrap(),
+        "--title",
+        "Placement voice",
+        "--width",
+        "320",
+        "--height",
+        "180",
+    ]));
+    let mut version = add_opening_shot(&dir, initial["version"].as_str().unwrap());
+    version = write_version(&dir, &version, &["add-cut", "--name", "Revision"]);
+    version = write_version(
+        &dir,
+        &version,
+        &["add-clip", "--cut", "cut-1", "--shot", "shot-1"],
+    );
+    version = write_version(
+        &dir,
+        &version,
+        &["add-clip", "--cut", "cut-1", "--shot", "shot-1"],
+    );
+    let voice = workspace.path().join("voice.wav");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=880:sample_rate=48000:duration=3",
+            "-y",
+        ])
+        .arg(&voice)
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+    let relative = std::path::PathBuf::from("sources/imported-audio")
+        .join(uuid::Uuid::new_v4().to_string())
+        .join("original.wav");
+    storyboard_store::import_source(&dir, &voice, &relative).unwrap();
+    let patch = serde_json::from_value(serde_json::json!({
+        "source_audio": {"src": relative.to_str().unwrap(), "start": 0.0, "end": 3.0}
+    }))
+    .unwrap();
+    storyboard_store::commit(
+        &dir,
+        &version,
+        vec![storyboard_core::Op::UpdateClip {
+            cut: "cut-1".into(),
+            clip: "clip-1".into(),
+            patch,
+        }],
+        storyboard_core::Author::Human,
+        None,
+    )
+    .unwrap();
+    let result = json(storyboard().args(["export-movie", dir.to_str().unwrap(), "--cut", "cut-1"]));
+    assert_eq!(result["frames"], 120);
+    let output = Path::new(result["path"].as_str().unwrap());
+    let sample = |at: &str| {
+        let decoded = Command::new("ffmpeg")
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-ss", at])
+            .arg("-i")
+            .arg(output)
+            .args(["-t", "0.2", "-vn", "-ac", "1", "-f", "s16le", "pipe:1"])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        decoded
+            .stdout
+            .chunks_exact(2)
+            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]).unsigned_abs())
+            .max()
+            .unwrap_or_default()
+    };
+    assert!(
+        sample("2.5") > 500,
+        "placement VO should play after source shot time"
+    );
+    assert!(sample("3.5") < 100, "the next placement should be silent");
+}
+
+#[test]
+fn cli_exports_more_than_256_cut_segments_without_dropping_frames() {
+    if Command::new("ffmpeg").arg("-version").output().is_err()
+        || Command::new("ffprobe").arg("-version").output().is_err()
+    {
+        return;
+    }
+    let workspace = TempDir::new().unwrap();
+    let dir = workspace.path().join("project");
+    let created = json(storyboard().args([
+        "new",
+        dir.to_str().unwrap(),
+        "--title",
+        "Long cut",
+        "--width",
+        "320",
+        "--height",
+        "180",
+    ]));
+    let version = add_opening_shot(&dir, created["version"].as_str().unwrap());
+    for (index, color) in [[255, 0, 0, 255], [0, 255, 0, 255]].into_iter().enumerate() {
+        let frame = workspace.path().join(format!("frame-{}.png", index + 1));
+        ImageBuffer::<Rgba<u8>, _>::from_pixel(320, 180, Rgba(color))
+            .save(frame)
+            .unwrap();
+    }
+    let movie = workspace.path().join("two-frames.mp4");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-framerate",
+            "24",
+            "-i",
+        ])
+        .arg(workspace.path().join("frame-%d.png"))
+        .args([
+            "-frames:v",
+            "2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-y",
+        ])
+        .arg(&movie)
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let replaced = json(storyboard().args([
+        "replace-movie",
+        dir.to_str().unwrap(),
+        "--base-version",
+        &version,
+        "--author",
+        "human",
+        "--shot",
+        "shot-1",
+        "--source",
+        movie.to_str().unwrap(),
+    ]));
+    let version = write_version(
+        &dir,
+        replaced["version"].as_str().unwrap(),
+        &["add-cut", "--name", "Many segments"],
+    );
+    let voice = workspace.path().join("voice.wav");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=2",
+            "-y",
+        ])
+        .arg(&voice)
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+    let relative = std::path::PathBuf::from("sources/imported-audio")
+        .join(uuid::Uuid::new_v4().to_string())
+        .join("original.wav");
+    storyboard_store::import_source(&dir, &voice, &relative).unwrap();
+    let mut ops = vec![serde_json::from_value(serde_json::json!({
+        "update_shot": {"shot":"shot-1", "patch":{"duration":2.0, "source_audio":{"src":relative.to_str().unwrap(), "start":0.0, "end":2.0}}}
+    })).unwrap()];
+    for index in 0..257 {
+        let id = format!("clip-many-{index}");
+        ops.push(
+            serde_json::from_value(serde_json::json!({
+                "add_clip": {"cut":"cut-1", "id":id, "source":{"shot":{"shot":"shot-1"}}}
+            }))
+            .unwrap(),
+        );
+        ops.push(
+            serde_json::from_value(serde_json::json!({
+                "update_clip": {"cut":"cut-1", "clip":id, "patch":{"in":index % 2, "out":index % 2 + 1}}
+            }))
+            .unwrap(),
+        );
+    }
+    storyboard_store::commit(
+        &dir,
+        &version,
+        vec![storyboard_core::Op::Batch { ops }],
+        storyboard_core::Author::Human,
+        None,
+    )
+    .unwrap();
+    let before = fs::read(dir.join("project.json")).unwrap();
+    let exported =
+        json(storyboard().args(["export-movie", dir.to_str().unwrap(), "--cut", "cut-1"]));
+    assert_eq!(exported["frames"], 257);
+    assert_eq!(fs::read(dir.join("project.json")).unwrap(), before);
+    let path = Path::new(exported["path"].as_str().unwrap());
+    let count = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(count.status.success());
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "257");
+    let audio = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&audio.stdout).trim(), "aac");
+    let pixels = Command::new("ffmpeg")
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error"])
+        .arg("-i")
+        .arg(path)
+        .args([
+            "-vf",
+            "scale=1:1",
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(pixels.status.success());
+    assert_eq!(pixels.stdout.len(), 257 * 3);
+    for frame in [31, 32, 63, 64, 255, 256] {
+        let bytes = &pixels.stdout[frame * 3..frame * 3 + 3];
+        if frame % 2 == 0 {
+            assert!(bytes[0] > 100 && bytes[1] < 100, "frame {frame}: {bytes:?}");
+        } else {
+            assert!(bytes[1] > 100 && bytes[0] < 100, "frame {frame}: {bytes:?}");
+        }
+    }
+    for time in ["1.35", "2.69", "9.35"] {
+        let samples = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                time,
+            ])
+            .arg("-i")
+            .arg(path)
+            .args(["-t", "0.05", "-vn", "-ac", "1", "-f", "s16le", "pipe:1"])
+            .output()
+            .unwrap();
+        assert!(samples.status.success());
+        assert!(
+            samples
+                .stdout
+                .chunks_exact(2)
+                .any(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]).unsigned_abs() > 500),
+            "audio missing after a chunk boundary at {time}s"
+        );
+    }
 }
