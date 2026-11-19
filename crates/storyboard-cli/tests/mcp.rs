@@ -1,7 +1,7 @@
 #[path = "support/mcp.rs"]
 mod support;
 
-use std::{collections::BTreeSet, fs};
+use std::{collections::BTreeSet, fs, process::Command};
 
 use clap::{CommandFactory, ValueHint};
 use serde_json::{Value, json};
@@ -9,6 +9,155 @@ use storyboard_cli::args::Cli;
 use tempfile::TempDir;
 
 use support::{Mcp, create_project, error, result};
+
+#[test]
+fn mcp_workspace_index_includes_fps() {
+    let (workspace, _project, _version) = create_project();
+    let mut mcp = Mcp::start(workspace.path(), "Codex");
+    let indexed = result(&mcp.tool("index", json!({})));
+    assert_eq!(indexed["projects"][0]["fps"], 24);
+}
+
+#[test]
+fn mcp_redo_reapplies_an_undone_write() {
+    let (workspace, project, version) = create_project();
+    let mut mcp = Mcp::start(workspace.path(), "Codex");
+    let added = result(&mcp.tool(
+        "add_scene",
+        json!({"project":project,"base_version":version,"title":"Opening"}),
+    ));
+    let undone = result(&mcp.tool(
+        "undo",
+        json!({"project":project,"base_version":added["version"]}),
+    ));
+    let redone = result(&mcp.tool(
+        "redo",
+        json!({"project":project,"base_version":undone["version"]}),
+    ));
+    assert_eq!(redone["version"], added["version"]);
+}
+
+#[test]
+fn claude_job_mcp_is_scoped_to_its_open_project() {
+    let (workspace, project, version) = create_project();
+    let sibling = workspace.path().join("other");
+    let created = Command::new(assert_cmd::cargo::cargo_bin("storyboard"))
+        .args(["new", sibling.to_str().unwrap(), "--title", "Other"])
+        .output()
+        .expect("create sibling");
+    assert!(created.status.success());
+
+    let mut mcp = Mcp::start_single_project(&project, "Claude");
+    let listed = mcp.request("tools/list", json!({}));
+    assert!(
+        !listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "new")
+    );
+    let shown = result(&mcp.tool("show", json!({"project":project})));
+    assert_eq!(shown["version"], version);
+    let shown_by_folder = result(&mcp.tool("show", json!({"project":"story"})));
+    assert_eq!(shown_by_folder["version"], version);
+    let shown_by_dot = result(&mcp.tool("show", json!({"project":"."})));
+    assert_eq!(shown_by_dot["version"], version);
+    let edited = result(&mcp.tool(
+        "add_scene",
+        json!({"project":project,"base_version":version,"title":"Revised"}),
+    ));
+    assert_ne!(edited["version"], shown["version"]);
+    let rejected = error(&mcp.tool("show", json!({"project":sibling})));
+    assert!(rejected.to_string().contains("only the open project"));
+    let rejected = error(&mcp.tool("new", json!({"project":"nested","title":"Nested"})));
+    assert!(
+        rejected
+            .to_string()
+            .contains("cannot create another project")
+    );
+    assert!(!project.join("nested").exists());
+}
+
+#[test]
+fn mcp_imports_numbered_boards_and_generated_movie() {
+    if Command::new("ffmpeg").arg("-version").output().is_err()
+        || Command::new("ffprobe").arg("-version").output().is_err()
+    {
+        return;
+    }
+    let (workspace, project, version) = create_project();
+    let mut mcp = Mcp::start(workspace.path(), "Claude");
+    let scene = result(&mcp.tool(
+        "add_scene",
+        json!({"project": project, "base_version": version, "title": "Opening"}),
+    ));
+    let first = workspace.path().join("frame-001.png");
+    let second = workspace.path().join("frame-002.png");
+    for path in [&first, &second] {
+        image::ImageBuffer::<image::Rgba<u8>, _>::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(path)
+            .expect("image fixture");
+    }
+    let imported = result(&mcp.tool("import_shot", json!({"project": project, "base_version": scene["version"], "scene": "scene-1", "title": "Generated boards", "images": [second, first]})));
+    let loaded = storyboard_store::open(&project).unwrap();
+    let shot = &loaded.project.scenes[0].shots[0];
+    assert_eq!(shot.takes[0].panels.len(), 2);
+    assert_eq!(shot.takes[0].panels[1].time, 1.0);
+    let shown = result(&mcp.tool("show", json!({"project": project})));
+    let take = &shown["scenes"][0]["shots"][0]["takes"][0];
+    assert_eq!(take["panels"], 2);
+    assert_eq!(take["panel_details"][0]["id"], shot.takes[0].panels[0].id);
+    assert_eq!(take["panel_details"][1]["time"], 1.0);
+    assert_eq!(
+        take["panel_details"][0]["layers"][0]["src"].as_str(),
+        shot.takes[0].panels[0].layers[0].src.as_deref()
+    );
+    let movie = workspace.path().join("generated.mp4");
+    let encoded = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=160x90:r=24",
+            "-t",
+            "2",
+            "-pix_fmt",
+            "yuv420p",
+            "-y",
+        ])
+        .arg(&movie)
+        .output()
+        .expect("movie fixture");
+    assert!(
+        encoded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encoded.stderr)
+    );
+    let replaced = result(&mcp.tool("replace_movie", json!({"project": project, "base_version": imported["version"], "shot": shot.id, "source": movie})));
+    let replacement_path = replaced["path"].as_str().unwrap();
+    assert!(replacement_path.starts_with("sources/imported-movies/"));
+    assert!(replacement_path.ends_with("/original.mp4"));
+    let reopened = storyboard_store::open(&project).unwrap();
+    assert_eq!(
+        reopened.project.scenes[0].shots[0]
+            .source_movie
+            .as_ref()
+            .unwrap()
+            .end,
+        2.0
+    );
+    let exported = result(&mcp.tool(
+        "export_movie",
+        json!({"project": project, "mode": "boards"}),
+    ));
+    assert_eq!(exported["frames"], 48);
+    let rendered = exported["path"].as_str().expect("export path");
+    assert!(rendered.starts_with(project.canonicalize().unwrap().to_str().unwrap()));
+    assert!(fs::metadata(rendered).unwrap().len() > 0);
+}
 
 #[test]
 fn mcp_tools_list_mirrors_every_cli_verb() {
@@ -24,7 +173,8 @@ fn mcp_tools_list_mirrors_every_cli_verb() {
     let expected: BTreeSet<_> = Cli::command()
         .get_subcommands()
         .map(|command| command.get_name())
-        .filter(|name| *name != "mcp")
+        // Entry points, not verbs on a project: MCP itself and the workbench server.
+        .filter(|name| !matches!(*name, "mcp" | "serve"))
         .map(|name| name.replace('-', "_"))
         .collect();
     let mirrored: BTreeSet<_> = names
@@ -44,7 +194,7 @@ fn mcp_every_tool_schema_matches_its_cli_arguments() {
     let cli = Cli::command();
     for command in cli
         .get_subcommands()
-        .filter(|command| command.get_name() != "mcp")
+        .filter(|command| !matches!(command.get_name(), "mcp" | "serve"))
     {
         let tool_name = command.get_name().replace('-', "_");
         let tool = tools
@@ -350,6 +500,7 @@ fn mcp_read_only_tools_do_not_advertise_full() {
         "show",
         "panel_image",
         "cut_sheet",
+        "export_movie",
         "notes",
         "schema",
     ] {
@@ -474,6 +625,10 @@ fn mcp_add_panel_accepts_explicit_shot_and_take() {
     let panel = result(&mcp.tool("add_panel", json!({"project": project, "base_version": shot["version"], "shot": "shot-1", "take": "take-1"})));
     let shown = result(&mcp.tool("show", json!({"project": project})));
     assert_eq!(shown["scenes"][0]["shots"][0]["takes"][0]["panels"], 2);
+    assert_eq!(
+        shown["scenes"][0]["shots"][0]["takes"][0]["panel_details"][1]["id"],
+        "panel-2"
+    );
     assert_eq!(panel["ids"], json!(["panel-2"]));
 }
 
@@ -506,6 +661,48 @@ fn mcp_apply_reports_every_created_id() {
         }),
     ));
     assert_eq!(write["ids"], json!(["scene-1", "scene-2"]));
+}
+
+#[test]
+fn mcp_media_patch_extends_saved_shot_and_cut_timing() {
+    let (workspace, project, version) = create_project();
+    let mut mcp = Mcp::start(workspace.path(), "Claude");
+    let scene = result(&mcp.tool(
+        "add_scene",
+        json!({"project": project, "base_version": version, "title": "Opening"}),
+    ));
+    let shot = result(&mcp.tool(
+        "add_shot",
+        json!({"project": project, "base_version": scene["version"], "scene": "scene-1", "title": "VO shot"}),
+    ));
+    let cut = result(&mcp.tool(
+        "apply",
+        json!({
+            "project": project, "base_version": shot["version"],
+            "ops": [
+                {"add_cut": {"id": "cut-1", "name": "Revision"}},
+                {"add_clip": {"cut": "cut-1", "source": {"shot": {"shot": "shot-1"}}}}
+            ]
+        }),
+    ));
+    let saved = result(&mcp.tool(
+        "apply",
+        json!({
+            "project": project, "base_version": cut["version"],
+            "ops": [{"update_shot": {"shot": "shot-1", "patch": {"source_audio": {
+                "src": "sources/imported-audio/voice/original.wav", "start": 0.0, "end": 3.0
+            }}}}]
+        }),
+    ));
+    assert_eq!(saved["version"].as_str().map(str::len), Some(64));
+    let reopened = storyboard_store::open(&project).unwrap();
+    assert_eq!(reopened.project.scenes[0].shots[0].duration, 3.0);
+    assert_eq!(
+        storyboard_core::compile_cut(&reopened.project, "cut-1")
+            .unwrap()
+            .frames,
+        72
+    );
 }
 
 #[test]

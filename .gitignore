@@ -1,4 +1,5 @@
 .DS_Store
 *.tmp
 target/
+dist/
 .superpowers/

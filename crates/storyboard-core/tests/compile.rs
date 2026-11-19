@@ -1,6 +1,6 @@
 use storyboard_core::{
-    Clip, ClipSource, CompileError, Cut, CutSource, ExtraFields, Panel, Project, ShotSource,
-    compile_active, compile_cut, compile_story, sample, validate,
+    AudioRange, Clip, ClipSource, CompileError, Cut, CutSource, ExtraFields, Panel, Project,
+    ShotSource, compile_active, compile_cut, compile_story, sample, validate,
 };
 
 const SMALL: &str = include_str!("fixtures/small.json");
@@ -18,6 +18,7 @@ fn shot_clip(id: impl Into<String>, shot: &str) -> Clip {
             extra: ExtraFields::default(),
             source_extra: ExtraFields::default(),
         }),
+        source_audio: None,
         in_frame: 0,
         out_frame: None,
         slot: None,
@@ -33,6 +34,7 @@ fn cut_clip(id: impl Into<String>, cut: &str) -> Clip {
             extra: ExtraFields::default(),
             source_extra: ExtraFields::default(),
         }),
+        source_audio: None,
         in_frame: 0,
         out_frame: None,
         slot: None,
@@ -47,6 +49,36 @@ fn cut(id: impl Into<String>, clips: Vec<Clip>) -> Cut {
         clips,
         extra: ExtraFields::default(),
     }
+}
+
+#[test]
+fn placement_voice_extends_only_its_own_shot_clip_and_respects_trim() {
+    let mut project = fixture();
+    let mut voiced = shot_clip("voiced", "shot-1");
+    voiced.source_audio = Some(AudioRange {
+        src: "sources/imported-audio/voice/original.wav".into(),
+        start: 1.0,
+        end: 4.0,
+    });
+    project.cuts = vec![cut("revision", vec![voiced, shot_clip("plain", "shot-1")])];
+    let sequence = compile_cut(&project, "revision").unwrap();
+    assert_eq!(sequence.frames, 120);
+    assert_eq!((sequence.items[0].start, sequence.items[0].end), (0, 72));
+    assert_eq!((sequence.items[1].start, sequence.items[1].end), (72, 120));
+    assert_eq!(project.scenes[0].shots[0].duration, 2.0);
+
+    project.cuts[0].clips[0].out_frame = Some(60);
+    let trimmed = compile_cut(&project, "revision").unwrap();
+    assert_eq!(trimmed.frames, 108);
+    assert_eq!(trimmed.items[1].start, 60);
+
+    project.cuts[0].clips.truncate(1);
+    project.cuts[0].clips[0].out_frame = None;
+    project.scenes[0].shots[0].duration = 0.0;
+    project.scenes[0].shots[0].takes[0].panels.clear();
+    let audio_only = compile_cut(&project, "revision").unwrap();
+    assert_eq!(audio_only.frames, 72);
+    assert_eq!(audio_only.items[0].shot, "shot-1");
 }
 
 #[test]
@@ -115,6 +147,8 @@ fn compile_nested_expands_in_place() {
     assert_eq!((compiled.items[0].start, compiled.items[0].end), (0, 48));
     assert_eq!(compiled.items[1].shot, "shot-3");
     assert_eq!((compiled.items[1].start, compiled.items[1].end), (48, 72));
+    assert_eq!(compiled.items[1].clip.as_deref(), Some("clip-2"));
+    assert_eq!(compiled.items[1].leaf_clip.as_deref(), Some("clip-3"));
 }
 
 #[test]

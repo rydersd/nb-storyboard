@@ -13,7 +13,8 @@ use storyboard_core::{
     render_panel,
 };
 use storyboard_store::{
-    CommitError, StoreError, check_refs, commit, create, history, open, scan_sources, undo,
+    CommitError, Loaded, StoreError, check_refs, commit, create, history, open, redo, scan_sources,
+    undo,
 };
 
 use crate::args::{CutSheetArgs, PanelImageArgs};
@@ -162,6 +163,16 @@ pub fn undo_ops(
     steps: usize,
 ) -> Result<Value, ApiError> {
     let record = undo(dir, base_version, author, steps)?;
+    Ok(json!({ "version": record.version, "summary": record.summary, "rebased": record.rebased }))
+}
+
+pub fn redo_ops(
+    dir: &Path,
+    base_version: &str,
+    author: Author,
+    steps: usize,
+) -> Result<Value, ApiError> {
+    let record = redo(dir, base_version, author, steps)?;
     Ok(json!({ "version": record.version, "summary": record.summary, "rebased": record.rebased }))
 }
 
@@ -677,6 +688,10 @@ pub fn target(
 
 pub fn show(dir: &Path, cut: Option<&str>) -> Result<Value, ApiError> {
     let loaded = open(dir)?;
+    show_loaded(&loaded, cut)
+}
+
+pub(crate) fn show_loaded(loaded: &Loaded, cut: Option<&str>) -> Result<Value, ApiError> {
     if let Some(cut) = cut
         && !loaded
             .project
@@ -705,16 +720,16 @@ pub fn show(dir: &Path, cut: Option<&str>) -> Result<Value, ApiError> {
     };
     let shots: Vec<_> = sequence.items.iter().enumerate().map(|(index, item)| {
         let shot = loaded.project.scenes.iter().flat_map(|scene| &scene.shots).find(|shot| shot.id == item.shot);
-        json!({"position": index + 1, "start": item.start, "end": item.end, "shot": item.shot, "take": item.take, "title": shot.map(|shot| shot.title.clone()).unwrap_or_default(), "duration": shot.map(|shot| shot.duration).unwrap_or_default(), "offset": item.offset, "clip": item.clip})
+        json!({"position": index + 1, "start": item.start, "end": item.end, "shot": item.shot, "take": item.take, "title": shot.map(|shot| shot.title.clone()).unwrap_or_default(), "duration": shot.map(|shot| shot.duration).unwrap_or_default(), "offset": item.offset, "clip": item.clip, "leaf_clip": item.leaf_clip, "nested": item.clip != item.leaf_clip})
     }).collect();
-    let scenes: Vec<_> = loaded.project.scenes.iter().map(|scene| json!({"id": scene.id, "title": scene.title, "shots": scene.shots.iter().map(|shot| json!({"id": shot.id, "title": shot.title, "duration": shot.duration, "action": shot.action, "dialogue": shot.dialogue, "notes": shot.notes, "selected_take": shot.selected_take, "takes": shot.takes.iter().map(|take| json!({"id": take.id, "name": take.name, "panels": take.panels.len()})).collect::<Vec<_>>() })).collect::<Vec<_>>() })).collect();
+    let scenes: Vec<_> = loaded.project.scenes.iter().map(|scene| json!({"id": scene.id, "title": scene.title, "shots": scene.shots.iter().map(|shot| json!({"id": shot.id, "title": shot.title, "duration": shot.duration, "source_movie": shot.source_movie, "source_audio": shot.source_audio, "action": shot.action, "dialogue": shot.dialogue, "notes": shot.notes, "selected_take": shot.selected_take, "takes": shot.takes.iter().map(|take| json!({"id": take.id, "name": take.name, "panels": take.panels.len(), "panel_details": take.panels.iter().map(|panel| json!({"id": panel.id, "time": panel.time, "title": panel.title, "direction": panel.direction, "background": panel.background, "layers": panel.layers, "strokes": panel.strokes.len()})).collect::<Vec<_>>() })).collect::<Vec<_>>() })).collect::<Vec<_>>() })).collect();
     let mut warnings: Vec<_> = sequence
         .warnings
         .iter()
         .map(|warning| json!({"field": warning.field, "message": warning.message}))
         .collect();
     warnings.extend(
-        check_refs(dir, &loaded.project)?
+        check_refs(&loaded.dir, &loaded.project)?
             .into_iter()
             .map(|missing| {
                 json!({
@@ -724,7 +739,7 @@ pub fn show(dir: &Path, cut: Option<&str>) -> Result<Value, ApiError> {
             }),
     );
     Ok(
-        json!({"version": loaded.version, "cut": cut, "frames": sequence.frames, "scenes": scenes, "shots": shots, "stickies": loaded.project.stickies, "positions": loaded.project.layout.positions, "warnings": warnings}),
+        json!({"version": loaded.version, "cut": cut, "active_cut": loaded.project.active_cut, "cuts": loaded.project.cuts, "frames": sequence.frames, "scenes": scenes, "shots": shots, "stickies": loaded.project.stickies, "positions": loaded.project.layout.positions, "warnings": warnings}),
     )
 }
 
@@ -1535,11 +1550,12 @@ pub fn map_error(error: ApiError) -> Value {
             reason,
             intervening,
         }) => {
-            let no_undo = reason == "not enough commits by this author to undo";
+            let no_history = reason == "not enough commits by this author to undo"
+                || reason == "not enough undone commits by this author to redo";
             (
-                if no_undo { "not_found" } else { "conflict" },
+                if no_history { "not_found" } else { "conflict" },
                 reason,
-                if no_undo {
+                if no_history {
                     "use storyboard history to find a commit by this author".into()
                 } else {
                     "read the current version and retry the edit".into()

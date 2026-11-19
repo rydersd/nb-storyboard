@@ -32,12 +32,18 @@ pub struct WriteArgs {
 pub enum Command {
     #[command(about = "Serve MCP tools over standard input and output")]
     Mcp(McpArgs),
+    #[command(about = "Open the workbench: a local browser interface for a workspace")]
+    Serve(ServeArgs),
     #[command(about = "Create an empty project")]
     New(NewArgs),
+    #[command(about = "List projects in a workspace")]
+    Index(IndexArgs),
     #[command(about = "Add a scene")]
     AddScene(AddSceneArgs),
     #[command(about = "Add a shot with a take and blank panel")]
     AddShot(AddShotArgs),
+    #[command(about = "Import numbered images as panels of one shot")]
+    ImportShot(ImportShotArgs),
     #[command(about = "Remove a scene")]
     RemoveScene(RemoveSceneArgs),
     #[command(about = "Remove a shot")]
@@ -76,6 +82,8 @@ pub enum Command {
     SetActiveCut(SetActiveCutArgs),
     #[command(about = "Set a shot's story fields")]
     SetShot(SetShotArgs),
+    #[command(about = "Attach a generated MP4 to a shot through an undoable project edit")]
+    ReplaceMovie(ReplaceMovieArgs),
     #[command(about = "Move a shot to another scene", alias = "move-shot")]
     MoveShotToScene(MoveShotToSceneArgs),
     #[command(about = "Reorder a shot within its scene")]
@@ -90,10 +98,14 @@ pub enum Command {
     Trim(TrimArgs),
     #[command(about = "Undo your most recent commits")]
     Undo(UndoArgs),
+    #[command(about = "Redo your most recently undone commits")]
+    Redo(RedoArgs),
     #[command(about = "Show local commit history")]
     History(HistoryArgs),
     #[command(about = "Show the active sequence as a readable table")]
     Show(ShowArgs),
+    #[command(about = "Render a cut as H.264/AAC MP4 under the project's .cache/exports")]
+    ExportMovie(ExportMovieArgs),
     #[command(about = "Describe one panel and all of its layers")]
     Describe(DescribeArgs),
     #[command(about = "Render one panel to PNG")]
@@ -110,6 +122,20 @@ pub enum Command {
     Notes(NotesArgs),
     #[command(about = "Print public operation and layer shapes")]
     Schema(SchemaArgs),
+}
+
+#[derive(Args, JsonSchema)]
+pub struct ServeArgs {
+    #[arg(default_value = ".", help = "Workspace folder containing projects")]
+    pub workspace: PathBuf,
+    #[arg(
+        long,
+        default_value_t = 7420,
+        help = "Port on 127.0.0.1 (0 picks a free one)"
+    )]
+    pub port: u16,
+    #[arg(long, help = "Do not open a browser")]
+    pub no_open: bool,
 }
 
 #[derive(Args, JsonSchema)]
@@ -137,6 +163,12 @@ pub struct NewArgs {
 }
 
 #[derive(Args, JsonSchema)]
+pub struct IndexArgs {
+    #[arg(default_value = ".", help = "Workspace folder containing projects")]
+    pub workspace: PathBuf,
+}
+
+#[derive(Args, JsonSchema)]
 pub struct AddSceneArgs {
     #[command(flatten)]
     #[schemars(flatten)]
@@ -161,6 +193,25 @@ pub struct AddShotArgs {
     pub id: Option<String>,
     #[arg(long, help = "Zero-based insertion index")]
     pub index: Option<usize>,
+}
+#[derive(Args, JsonSchema)]
+pub struct ImportShotArgs {
+    #[command(flatten)]
+    #[schemars(flatten)]
+    pub write: WriteArgs,
+    #[arg(long, help = "Owning scene id")]
+    pub scene: String,
+    #[arg(long, help = "Shot title")]
+    pub title: String,
+    #[arg(
+        long,
+        help = "Shot duration in seconds; defaults to one second per image"
+    )]
+    pub duration: Option<f64>,
+    #[arg(long, help = "Zero-based insertion index")]
+    pub index: Option<usize>,
+    #[arg(required = true, help = "Numbered image files")]
+    pub images: Vec<PathBuf>,
 }
 #[derive(Args, JsonSchema)]
 pub struct RemoveSceneArgs {
@@ -454,6 +505,16 @@ pub struct SetShotArgs {
     pub duration: Option<f64>,
 }
 #[derive(Args, JsonSchema)]
+pub struct ReplaceMovieArgs {
+    #[command(flatten)]
+    #[schemars(flatten)]
+    pub write: WriteArgs,
+    #[arg(long, help = "Shot id to receive the movie")]
+    pub shot: String,
+    #[arg(long, help = "Generated MP4 file to copy into project sources")]
+    pub source: PathBuf,
+}
+#[derive(Args, JsonSchema)]
 pub struct MoveShotToSceneArgs {
     #[command(flatten)]
     #[schemars(flatten)]
@@ -524,6 +585,19 @@ pub struct UndoArgs {
     #[arg(long, default_value_t = 1, help = "Number of your commits to undo")]
     pub steps: usize,
 }
+
+#[derive(Args, JsonSchema)]
+pub struct RedoArgs {
+    #[command(flatten)]
+    #[schemars(flatten)]
+    pub write: WriteArgs,
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "Number of your undone commits to redo"
+    )]
+    pub steps: usize,
+}
 #[derive(Args, JsonSchema)]
 pub struct HistoryArgs {
     #[arg(help = "Project folder")]
@@ -539,6 +613,15 @@ pub struct ShowArgs {
     pub dir: PathBuf,
     #[arg(long, help = "Cut id instead of the active sequence")]
     pub cut: Option<String>,
+}
+#[derive(Args, JsonSchema)]
+pub struct ExportMovieArgs {
+    #[arg(help = "Project folder")]
+    pub dir: PathBuf,
+    #[arg(long, help = "Cut id instead of the active sequence")]
+    pub cut: Option<String>,
+    #[arg(long, default_value = "original", help = "Picture: original or boards")]
+    pub mode: String,
 }
 #[derive(Args, JsonSchema)]
 pub struct DescribeArgs {

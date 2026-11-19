@@ -160,7 +160,21 @@ pub fn commit(
     let _lock = ProjectLock::acquire(dir).map_err(StoreError::from)?;
     repair_log_tail_for_dir(dir).map_err(CommitError::Store)?;
     recover_pending_commit(dir).map_err(CommitError::Store)?;
-    commit_locked(dir, base_version, ops, author, note, None, None)
+    commit_locked(
+        dir,
+        base_version,
+        ops,
+        author,
+        note,
+        CommitMetadata::default(),
+    )
+}
+
+#[derive(Default)]
+struct CommitMetadata {
+    forced_footprints: Option<Vec<String>>,
+    undoes: Option<String>,
+    redoes: Option<String>,
 }
 
 fn commit_locked(
@@ -169,8 +183,7 @@ fn commit_locked(
     ops: Vec<Op>,
     author: Author,
     note: Option<String>,
-    forced_footprints: Option<Vec<String>>,
-    undoes: Option<String>,
+    metadata: CommitMetadata,
 ) -> Result<CommitRecord, CommitError> {
     let (project, old_bytes) = read_project(dir).map_err(CommitError::Store)?;
     let current_version = version_of(&old_bytes);
@@ -206,7 +219,7 @@ fn commit_locked(
         inverses.splice(0..0, applied.inverse);
         ours.extend(applied.footprints);
     }
-    let mut ours = forced_footprints.unwrap_or(ours);
+    let mut ours = metadata.forced_footprints.unwrap_or(ours);
     ours.sort();
     ours.dedup();
     let append_only_scenes = ops
@@ -255,7 +268,7 @@ fn commit_locked(
     let bytes = serialize_project(&candidate).map_err(CommitError::Store)?;
     let summary = note
         .clone()
-        .unwrap_or_else(|| summary_for(&ops, &intervening, &project));
+        .unwrap_or_else(|| summary_for(&ops, &intervening, &project, &candidate));
     let record = CommitRecord {
         version: version_of(&bytes),
         parent: current_version,
@@ -268,7 +281,8 @@ fn commit_locked(
         note,
         summary,
         external: false,
-        undoes,
+        undoes: metadata.undoes,
+        redoes: metadata.redoes,
     };
     match persist_commit(dir, &old_bytes, &record, &bytes) {
         Ok(()) => {}
@@ -311,20 +325,16 @@ pub fn undo(
             intervening,
         });
     }
-    let already_undone: BTreeSet<_> = records
+    let state = history_state(&records);
+    let mut active: Vec<_> = state
+        .active
         .iter()
-        .filter_map(|record| record.undoes.clone())
+        .filter(|(index, _)| records[**index].author == author)
+        .map(|(index, activation)| (*index, *activation))
         .collect();
-    let selected: Vec<_> = records
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, record)| {
-            !record.external
-                && record.undoes.is_none()
-                && !already_undone.contains(&record.version)
-                && record.author == author
-        })
+    active.sort_by_key(|(_, activation)| std::cmp::Reverse(*activation));
+    let selected: Vec<_> = active
+        .into_iter()
         .map(|(index, _)| index)
         .take(steps)
         .collect();
@@ -335,28 +345,9 @@ pub fn undo(
             intervening: Vec::new(),
         });
     }
-    let selected_positions: BTreeSet<_> = selected.iter().copied().collect();
     for &position in &selected {
-        let mut later_positions: Vec<_> = (position + 1..records.len())
-            .filter(|index| !selected_positions.contains(index))
-            .collect();
-        let mut cancelled = BTreeSet::new();
-        for &undo_index in &later_positions {
-            let Some(undone_version) = records[undo_index].undoes.as_deref() else {
-                continue;
-            };
-            if let Some(original_index) = later_positions.iter().rev().copied().find(|index| {
-                *index < undo_index
-                    && records[*index].undoes.is_none()
-                    && !records[*index].external
-                    && records[*index].version == undone_version
-            }) {
-                cancelled.insert(original_index);
-                cancelled.insert(undo_index);
-            }
-        }
-        later_positions.retain(|index| !cancelled.contains(index));
-
+        let activation = state.active[&position];
+        let later_positions = effective_later_positions(&records, &state, activation, &selected);
         let target = &records[position];
         let later_footprints: Vec<_> = later_positions
             .iter()
@@ -385,8 +376,221 @@ pub fn undo(
             target.inverses.clone(),
             author.clone(),
             Some(format!("undo {} of {steps} commit(s)", index + 1)),
-            Some(target.footprints.clone()),
-            Some(target.version.clone()),
+            CommitMetadata {
+                forced_footprints: Some(target.footprints.clone()),
+                undoes: Some(target.version.clone()),
+                redoes: None,
+            },
+        )?;
+        current_version = record.version.clone();
+        result = Some(record);
+    }
+    Ok(result.expect("steps is nonzero and selected has that many records"))
+}
+
+#[derive(Clone)]
+struct UndoneOccurrence {
+    target: usize,
+    undo_record: usize,
+}
+
+#[derive(Default)]
+struct AuthorRedo {
+    author: Option<Author>,
+    undone: Vec<UndoneOccurrence>,
+}
+
+#[derive(Default)]
+struct HistoryState {
+    /// Active regular commit occurrence -> its most recent application record position.
+    active: BTreeMap<usize, usize>,
+    redo: Vec<AuthorRedo>,
+}
+
+fn author_redo_mut<'a>(state: &'a mut HistoryState, author: &Author) -> &'a mut AuthorRedo {
+    if let Some(index) = state
+        .redo
+        .iter()
+        .position(|entry| entry.author.as_ref() == Some(author))
+    {
+        return &mut state.redo[index];
+    }
+    state.redo.push(AuthorRedo {
+        author: Some(author.clone()),
+        undone: Vec::new(),
+    });
+    state.redo.last_mut().expect("just pushed")
+}
+
+fn redo_selection(state: &HistoryState, author: &Author, steps: usize) -> Vec<UndoneOccurrence> {
+    state
+        .redo
+        .iter()
+        .find(|entry| entry.author.as_ref() == Some(author))
+        .map(|entry| entry.undone.iter().rev().take(steps).cloned().collect())
+        .unwrap_or_default()
+}
+
+fn history_state(records: &[CommitRecord]) -> HistoryState {
+    let mut state = HistoryState::default();
+    for (record_index, record) in records.iter().enumerate() {
+        if record.external {
+            continue;
+        }
+        if let Some(version) = record.undoes.as_deref() {
+            let target = state
+                .active
+                .iter()
+                .filter(|(index, _)| {
+                    let candidate = &records[**index];
+                    candidate.author == record.author && candidate.version == version
+                })
+                .max_by_key(|(_, activation)| **activation)
+                .map(|(index, _)| *index);
+            if let Some(target) = target {
+                state.active.remove(&target);
+                author_redo_mut(&mut state, &record.author)
+                    .undone
+                    .push(UndoneOccurrence {
+                        target,
+                        undo_record: record_index,
+                    });
+            }
+            continue;
+        }
+        if let Some(version) = record.redoes.as_deref() {
+            let redo = author_redo_mut(&mut state, &record.author);
+            if let Some(position) = redo
+                .undone
+                .iter()
+                .rposition(|entry| records[entry.target].version == version)
+            {
+                let occurrence = redo.undone.remove(position);
+                state.active.insert(occurrence.target, record_index);
+            }
+            continue;
+        }
+        state.active.insert(record_index, record_index);
+        author_redo_mut(&mut state, &record.author).undone.clear();
+    }
+    state
+}
+
+fn effective_later_positions(
+    records: &[CommitRecord],
+    state: &HistoryState,
+    after: usize,
+    excluded: &[usize],
+) -> Vec<usize> {
+    let mut positions: Vec<_> = state
+        .active
+        .iter()
+        .filter(|(target, activation)| **activation > after && !excluded.contains(target))
+        .map(|(_, activation)| *activation)
+        .chain(
+            records
+                .iter()
+                .enumerate()
+                .filter(|(index, record)| record.external && *index > after)
+                .map(|(index, _)| index),
+        )
+        .collect();
+    positions.sort_unstable();
+    positions.dedup();
+    positions
+}
+
+pub fn redo(
+    dir: &Path,
+    base_version: &str,
+    author: Author,
+    steps: usize,
+) -> Result<CommitRecord, CommitError> {
+    if steps == 0 {
+        return Err(CommitError::EmptyCommit);
+    }
+    let _lock = ProjectLock::acquire(dir).map_err(StoreError::from)?;
+    repair_log_tail_for_dir(dir).map_err(CommitError::Store)?;
+    recover_pending_commit(dir).map_err(CommitError::Store)?;
+    let (project, project_bytes) = read_project(dir).map_err(CommitError::Store)?;
+    let mut current_version = version_of(&project_bytes);
+    let records = synchronize_external_edit(dir, &project, &project_bytes, &current_version)
+        .map_err(CommitError::Store)?;
+    let state = history_state(&records);
+    let selected = redo_selection(&state, &author, steps);
+    if base_version != current_version {
+        let Some(intervening) = records_since_from(&records, base_version) else {
+            return Err(CommitError::Conflict {
+                current_version,
+                reason: "base version is not in local history".into(),
+                intervening: Vec::new(),
+            });
+        };
+        if intervening
+            .last()
+            .is_none_or(|record| record.version != current_version)
+        {
+            return Err(CommitError::Conflict {
+                current_version,
+                reason: "history does not reach the on-disk project".into(),
+                intervening: intervening.iter().map(CommitSummary::from).collect(),
+            });
+        }
+        let base_state = history_state(&records[..records.len() - intervening.len()]);
+        let requested = redo_selection(&base_state, &author, steps);
+        if requested
+            .iter()
+            .map(|entry| entry.target)
+            .ne(selected.iter().map(|entry| entry.target))
+        {
+            return Err(CommitError::Conflict {
+                current_version,
+                reason: "redo target changed since base version".into(),
+                intervening: intervening.iter().map(CommitSummary::from).collect(),
+            });
+        }
+    }
+    if selected.len() != steps {
+        return Err(CommitError::Conflict {
+            current_version,
+            reason: "not enough undone commits by this author to redo".into(),
+            intervening: Vec::new(),
+        });
+    }
+    for occurrence in &selected {
+        let target = &records[occurrence.target];
+        let later_positions =
+            effective_later_positions(&records, &state, occurrence.undo_record, &[]);
+        let later_footprints: Vec<_> = later_positions
+            .iter()
+            .flat_map(|index| records[*index].footprints.iter().cloned())
+            .collect();
+        if !disjoint(&target.footprints, &later_footprints) {
+            return Err(CommitError::Conflict {
+                current_version,
+                reason: "redo footprint overlaps a later commit".into(),
+                intervening: later_positions
+                    .iter()
+                    .map(|index| CommitSummary::from(&records[*index]))
+                    .collect(),
+            });
+        }
+    }
+    let mut result = None;
+    for (index, occurrence) in selected.iter().enumerate() {
+        let target = &records[occurrence.target];
+        let undo_record = &records[occurrence.undo_record];
+        let record = commit_locked(
+            dir,
+            &current_version,
+            undo_record.inverses.clone(),
+            author.clone(),
+            Some(format!("redo {} of {steps} commit(s)", index + 1)),
+            CommitMetadata {
+                forced_footprints: Some(target.footprints.clone()),
+                undoes: None,
+                redoes: Some(target.version.clone()),
+            },
         )?;
         current_version = record.version.clone();
         result = Some(record);
@@ -423,6 +627,7 @@ fn synchronize_external_edit(
         summary: "external edit".into(),
         external: true,
         undoes: None,
+        redoes: None,
     };
     let baseline = dir
         .join("history")
@@ -695,138 +900,387 @@ fn now() -> String {
         .expect("UTC timestamps format as RFC 3339")
 }
 
-fn summary_for(ops: &[Op], intervening: &[CommitRecord], before: &Project) -> String {
-    let resolved = |sticky: &str| {
-        before
-            .stickies
-            .iter()
-            .any(|note| note.id == sticky && note.resolved)
-    };
+fn summary_for(
+    ops: &[Op],
+    intervening: &[CommitRecord],
+    before: &Project,
+    after: &Project,
+) -> String {
     let prefix = if intervening.is_empty() {
         ""
     } else {
         "rebased "
     };
-    let detail = ops
-        .iter()
-        .map(|op| op_summary(op, &resolved))
-        .collect::<Vec<_>>()
-        .join("; ");
-    format!("{prefix}{detail}")
+    let mut flattened = Vec::new();
+    flatten_ops(ops, &mut flattened);
+    let detail = aggregate_summary(&flattened).unwrap_or_else(|| {
+        flattened
+            .iter()
+            .map(|op| op_summary(op, before, after))
+            .collect::<Vec<_>>()
+            .join("; ")
+    });
+    one_line_under_120(&format!("{prefix}{detail}"))
 }
 
-fn op_summary(op: &Op, resolved: &dyn Fn(&str) -> bool) -> String {
-    match op {
-        Op::Batch { ops } => format!(
-            "batch ({})",
-            ops.iter()
-                .map(|op| op_summary(op, resolved))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ),
-        Op::AddScene { .. } => "add-scene".into(),
-        Op::RemoveScene { scene } => format!("remove-scene {scene}"),
-        Op::MoveScene { scene, index } => format!("move-scene {scene} to {index}"),
-        Op::UpdateScene { scene, .. } => format!("update-scene {scene}"),
-        Op::AddShot { scene, .. } => format!("add-shot to {scene}"),
-        Op::RemoveShot { shot } => format!("remove-shot {shot}"),
-        Op::MoveShot { shot, index } => format!("reorder-shot {shot} to {index}"),
-        Op::UpdateShot { shot, .. } => format!("update-shot {shot}"),
-        Op::AddTake { shot, .. } => format!("add-take to {shot}"),
-        Op::RemoveTake { shot, take } => format!("remove-take {shot}/{take}"),
-        Op::MoveTake { shot, take, index } => format!("move-take {shot}/{take} to {index}"),
-        Op::UpdateTake { shot, take, .. } => format!("update-take {shot}/{take}"),
-        Op::SelectTake { shot, take } => format!("select-take {shot}/{take}"),
-        Op::DuplicateTake { shot, take, .. } => format!("duplicate-take {shot}/{take}"),
-        Op::AddPanel { shot, take, .. } => format!("add-panel to {shot}/{take}"),
-        Op::RemovePanel { shot, take, panel } => format!("remove-panel {shot}/{take}/{panel}"),
-        Op::MovePanel {
-            shot,
-            take,
-            panel,
-            index,
-        } => {
-            format!("move-panel {shot}/{take}/{panel} to {index}")
+fn flatten_ops<'a>(ops: &'a [Op], flattened: &mut Vec<&'a Op>) {
+    for op in ops {
+        match op {
+            Op::Batch { ops } => flatten_ops(ops, flattened),
+            other => flattened.push(other),
         }
+    }
+}
+
+fn aggregate_summary(ops: &[&Op]) -> Option<String> {
+    if ops.len() < 2 {
+        return None;
+    }
+    if ops.iter().all(|op| matches!(op, Op::MoveScene { .. })) {
+        return Some(format!("reordered {} scenes", ops.len()));
+    }
+    if ops.iter().all(|op| matches!(op, Op::MoveShot { .. })) {
+        return Some(format!("reordered {} shots", ops.len()));
+    }
+    if ops.iter().all(|op| matches!(op, Op::MoveTake { .. })) {
+        return Some(format!("reordered {} takes", ops.len()));
+    }
+    if ops.iter().all(|op| matches!(op, Op::MovePanel { .. })) {
+        return Some(format!("reordered {} panels", ops.len()));
+    }
+    if ops.iter().all(|op| matches!(op, Op::MoveLayer { .. })) {
+        return Some(format!("reordered {} layers", ops.len()));
+    }
+    if ops.iter().all(|op| matches!(op, Op::ReorderClip { .. })) {
+        return Some(format!("reordered {} clips", ops.len()));
+    }
+    None
+}
+
+fn one_line_under_120(summary: &str) -> String {
+    let clean = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.chars().count() < 120 {
+        return clean;
+    }
+    let mut shortened: String = clean.chars().take(116).collect();
+    shortened.push('…');
+    shortened
+}
+
+fn quoted(value: &str) -> String {
+    format!(
+        "\u{201c}{}\u{201d}",
+        value.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
+}
+
+fn titled(title: &str, id: &str) -> String {
+    quoted(if title.trim().is_empty() { id } else { title })
+}
+
+fn scene_name(before: &Project, after: &Project, id: &str) -> String {
+    before
+        .scenes
+        .iter()
+        .chain(&after.scenes)
+        .find(|scene| scene.id == id)
+        .map(|scene| titled(&scene.title, &scene.id))
+        .unwrap_or_else(|| quoted(id))
+}
+
+fn shot<'a>(project: &'a Project, id: &str) -> Option<&'a storyboard_core::Shot> {
+    project
+        .scenes
+        .iter()
+        .flat_map(|scene| &scene.shots)
+        .find(|shot| shot.id == id)
+}
+
+fn shot_name(before: &Project, after: &Project, id: &str) -> String {
+    shot(before, id)
+        .or_else(|| shot(after, id))
+        .map(|shot| titled(&shot.title, &shot.id))
+        .unwrap_or_else(|| quoted(id))
+}
+
+fn take_name(before: &Project, after: &Project, shot_id: &str, take_id: &str) -> String {
+    shot(before, shot_id)
+        .or_else(|| shot(after, shot_id))
+        .and_then(|shot| shot.takes.iter().find(|take| take.id == take_id))
+        .map(|take| titled(&take.name, &take.id))
+        .unwrap_or_else(|| quoted(take_id))
+}
+
+fn panel_name(
+    before: &Project,
+    after: &Project,
+    shot_id: &str,
+    take_id: &str,
+    panel_id: &str,
+) -> String {
+    shot(before, shot_id)
+        .or_else(|| shot(after, shot_id))
+        .and_then(|shot| shot.takes.iter().find(|take| take.id == take_id))
+        .and_then(|take| take.panels.iter().find(|panel| panel.id == panel_id))
+        .map(|panel| titled(&panel.title, &panel.id))
+        .unwrap_or_else(|| quoted(panel_id))
+}
+
+fn layer_name(
+    before: &Project,
+    after: &Project,
+    shot_id: &str,
+    take_id: &str,
+    panel_id: &str,
+    layer_id: &str,
+) -> String {
+    shot(before, shot_id)
+        .or_else(|| shot(after, shot_id))
+        .and_then(|shot| shot.takes.iter().find(|take| take.id == take_id))
+        .and_then(|take| take.panels.iter().find(|panel| panel.id == panel_id))
+        .and_then(|panel| panel.layers.iter().find(|layer| layer.id == layer_id))
+        .map(|layer| titled(&layer.label, &layer.id))
+        .unwrap_or_else(|| quoted(layer_id))
+}
+
+fn cut_name(before: &Project, after: &Project, id: &str) -> String {
+    before
+        .cuts
+        .iter()
+        .chain(&after.cuts)
+        .find(|cut| cut.id == id)
+        .map(|cut| titled(&cut.name, &cut.id))
+        .unwrap_or_else(|| quoted(id))
+}
+
+fn target_name(before: &Project, after: &Project, target: &storyboard_core::RefTarget) -> String {
+    match target {
+        storyboard_core::RefTarget::Shot { shot: shot_id } => {
+            match shot(before, shot_id).or_else(|| shot(after, shot_id)) {
+                Some(found) if found.title != found.id => {
+                    format!("shot {} ({})", found.id, quoted(&found.title))
+                }
+                _ => format!("shot {shot_id}"),
+            }
+        }
+        storyboard_core::RefTarget::Take {
+            shot: shot_id,
+            take: take_id,
+        } => {
+            let target = format!("take {shot_id}/{take_id}");
+            match (
+                shot(before, shot_id).or_else(|| shot(after, shot_id)),
+                shot(before, shot_id)
+                    .or_else(|| shot(after, shot_id))
+                    .and_then(|found| {
+                        found
+                            .takes
+                            .iter()
+                            .find(|candidate| candidate.id == *take_id)
+                    }),
+            ) {
+                (Some(found_shot), Some(found_take))
+                    if found_shot.title != found_shot.id || found_take.name != found_take.id =>
+                {
+                    format!(
+                        "{target} ({} / {})",
+                        quoted(&found_shot.title),
+                        quoted(&found_take.name)
+                    )
+                }
+                _ => target,
+            }
+        }
+    }
+}
+
+fn node_name(before: &Project, after: &Project, node: &str) -> String {
+    match node.split_once(':') {
+        Some(("scene", id)) => scene_name(before, after, id),
+        Some(("shot", id)) => shot_name(before, after, id),
+        Some(("cut", id)) => cut_name(before, after, id),
+        _ => quoted(node),
+    }
+}
+
+fn op_summary(op: &Op, before: &Project, after: &Project) -> String {
+    match op {
+        Op::Batch { ops } => summary_for(ops, &[], before, after),
+        Op::AddScene { title, .. } => format!("added scene {}", titled(title, "scene")),
+        Op::RemoveScene { scene } => format!("removed scene {}", scene_name(before, after, scene)),
+        Op::MoveScene { scene, .. } => {
+            format!("reordered scene {}", scene_name(before, after, scene))
+        }
+        Op::UpdateScene { scene, .. } => {
+            format!("updated scene {}", scene_name(before, after, scene))
+        }
+        Op::AddShot { scene, title, .. } => format!(
+            "added shot {} to {}",
+            titled(title, "shot"),
+            scene_name(before, after, scene)
+        ),
+        Op::DuplicateShot { shot, .. } => {
+            format!("duplicated shot {}", shot_name(before, after, shot))
+        }
+        Op::RemoveShot { shot } => format!("removed shot {}", shot_name(before, after, shot)),
+        Op::MoveShot { shot, .. } => format!("reordered shot {}", shot_name(before, after, shot)),
+        Op::UpdateShot { shot, .. } => format!("updated shot {}", shot_name(before, after, shot)),
+        Op::AddTake { shot, name, .. } => format!(
+            "added take {} to {}",
+            titled(name, "take"),
+            shot_name(before, after, shot)
+        ),
+        Op::RemoveTake { shot, take } => format!(
+            "removed take {} from {}",
+            take_name(before, after, shot, take),
+            shot_name(before, after, shot)
+        ),
+        Op::MoveTake { shot, take, .. } => format!(
+            "reordered take {} in {}",
+            take_name(before, after, shot, take),
+            shot_name(before, after, shot)
+        ),
+        Op::UpdateTake { shot, take, .. } => format!(
+            "updated take {} in {}",
+            take_name(before, after, shot, take),
+            shot_name(before, after, shot)
+        ),
+        Op::SelectTake { shot, take } => format!(
+            "selected take {} for {}",
+            take_name(before, after, shot, take),
+            shot_name(before, after, shot)
+        ),
+        Op::DuplicateTake { shot, take, .. } => format!(
+            "duplicated take {} in {}",
+            take_name(before, after, shot, take),
+            shot_name(before, after, shot)
+        ),
+        Op::AddPanel { shot, take, .. } => format!(
+            "added panel to take {} of {}",
+            take_name(before, after, shot, take),
+            shot_name(before, after, shot)
+        ),
+        Op::RemovePanel { shot, take, panel } => format!(
+            "removed panel {} from {}",
+            panel_name(before, after, shot, take, panel),
+            shot_name(before, after, shot)
+        ),
+        Op::MovePanel {
+            shot, take, panel, ..
+        } => format!(
+            "reordered panel {} in {}",
+            panel_name(before, after, shot, take, panel),
+            shot_name(before, after, shot)
+        ),
         Op::UpdatePanel {
             shot, take, panel, ..
-        } => format!("update-panel {shot}/{take}/{panel}"),
+        } => format!(
+            "updated panel {} in {}",
+            panel_name(before, after, shot, take, panel),
+            shot_name(before, after, shot)
+        ),
         Op::AddLayer {
-            shot,
-            take,
-            panel,
-            layer_type,
-            ..
-        } => {
-            format!("add-{layer_type} to {shot}/{take}/{panel}")
-        }
+            shot, layer_type, ..
+        } => format!(
+            "added {layer_type} layer to {}",
+            shot_name(before, after, shot)
+        ),
         Op::RemoveLayer {
             shot,
             take,
             panel,
             layer,
-        } => {
-            format!("remove-layer {shot}/{take}/{panel}/{layer}")
-        }
+        } => format!(
+            "removed layer {} from {}",
+            layer_name(before, after, shot, take, panel, layer),
+            shot_name(before, after, shot)
+        ),
         Op::MoveLayer {
             shot,
             take,
             panel,
             layer,
-            index,
-        } => {
-            format!("move-layer {shot}/{take}/{panel}/{layer} to {index}")
-        }
+            ..
+        } => format!(
+            "reordered layer {} in {}",
+            layer_name(before, after, shot, take, panel, layer),
+            shot_name(before, after, shot)
+        ),
         Op::UpdateLayer {
             shot,
             take,
             panel,
             layer,
             ..
-        } => {
-            format!("update-layer {shot}/{take}/{panel}/{layer}")
+        } => format!(
+            "updated layer {} in {}",
+            layer_name(before, after, shot, take, panel, layer),
+            shot_name(before, after, shot)
+        ),
+        Op::AddSticky { .. } => "added note".into(),
+        Op::RemoveSticky { .. } => "removed note".into(),
+        Op::MoveSticky { .. } => "reordered note".into(),
+        Op::UpdateSticky { .. } => "updated note".into(),
+        Op::AddClip { cut, .. } => format!("added clip to cut {}", cut_name(before, after, cut)),
+        Op::RemoveClip { cut, .. } => {
+            format!("removed clip from cut {}", cut_name(before, after, cut))
         }
-        Op::AddSticky { .. } => "note".into(),
-        Op::RemoveSticky { sticky } => format!("remove-note {sticky}"),
-        Op::MoveSticky { sticky, index } => format!("move-note {sticky} to {index}"),
-        Op::UpdateSticky { sticky, .. } => format!("update-note {sticky}"),
-        Op::AddClip { cut, .. } => format!("add-clip to {cut}"),
-        Op::RemoveClip { cut, clip } => format!("remove-clip {clip} from {cut}"),
-        Op::ReorderClip { cut, clip, index } => format!("reorder-clip {clip} in {cut} to {index}"),
-        Op::UpdateClip { cut, clip, .. } => format!("update-clip {clip} in {cut}"),
-        Op::AddCut { .. } => "add-cut".into(),
-        Op::UpdateCut { cut, .. } => format!("update-cut {cut}"),
-        Op::RemoveCut { cut } => format!("remove-cut {cut}"),
+        Op::ReorderClip { cut, .. } => {
+            format!("reordered clip in cut {}", cut_name(before, after, cut))
+        }
+        Op::UpdateClip { cut, .. } => {
+            format!("updated clip in cut {}", cut_name(before, after, cut))
+        }
+        Op::MergeClips { cut, .. } => {
+            format!("merged clips in cut {}", cut_name(before, after, cut))
+        }
+        Op::GroupClips { cut, name, .. } => format!(
+            "grouped clips as {} in cut {}",
+            titled(name, "group"),
+            cut_name(before, after, cut)
+        ),
+        Op::UngroupClips { cut, .. } => {
+            format!("ungrouped clip in cut {}", cut_name(before, after, cut))
+        }
+        Op::AddCut { name, .. } => format!("added cut {}", titled(name, "cut")),
+        Op::UpdateCut { cut, .. } => format!("updated cut {}", cut_name(before, after, cut)),
+        Op::RemoveCut { cut } => format!("removed cut {}", cut_name(before, after, cut)),
         Op::SetActiveCut { cut } => match cut {
-            Some(cut) => format!("set-active-cut {cut}"),
-            None => "clear-active-cut".into(),
+            Some(cut) => format!("viewed cut {}", cut_name(before, after, cut)),
+            None => "viewed the story sequence".into(),
         },
-        Op::MoveShotBetweenScenes { shot, scene, index } => {
-            format!("move-shot-to-scene {shot} to {scene} at {index}")
-        }
+        Op::MoveShotBetweenScenes { shot, scene, .. } => format!(
+            "moved {} to {}",
+            shot_name(before, after, shot),
+            scene_name(before, after, scene)
+        ),
         Op::AddRef {
             target, reference, ..
-        } => format!("add-ref {reference} to {}", ref_target_summary(target)),
-        Op::RemoveRef { target, reference } => {
-            format!("remove-ref {reference} from {}", ref_target_summary(target))
+        } => format!(
+            "attached {} to {}",
+            quoted(reference),
+            target_name(before, after, target)
+        ),
+        Op::RemoveRef { target, reference } => format!(
+            "detached {} from {}",
+            quoted(reference),
+            target_name(before, after, target)
+        ),
+        Op::ResolveSticky { .. } => "resolved note".into(),
+        Op::ReplySticky { sticky, .. }
+            if before
+                .stickies
+                .iter()
+                .any(|note| note.id == *sticky && note.resolved) =>
+        {
+            "replied to resolved note; reopened thread".into()
         }
-        Op::ResolveSticky { sticky } => format!("resolve {sticky}"),
-        Op::ReplySticky { sticky, .. } if resolved(sticky) => {
-            format!("reply to {sticky}; reopen thread")
-        }
-        Op::ReplySticky { sticky, .. } => format!("reply to {sticky}"),
+        Op::ReplySticky { .. } => "replied to note".into(),
         Op::MoveNode { node, position } => match position {
-            Some(_) => format!("move-node {node}"),
-            None => format!("clear-node-position {node}"),
+            Some(_) => format!("moved {} in the graph", node_name(before, after, node)),
+            None => format!("reset {} in the graph", node_name(before, after, node)),
         },
-        Op::RestoreChanges { .. } => "undo".into(),
-    }
-}
-
-fn ref_target_summary(target: &storyboard_core::RefTarget) -> String {
-    match target {
-        storyboard_core::RefTarget::Shot { shot } => format!("shot {shot}"),
-        storyboard_core::RefTarget::Take { shot, take } => format!("take {shot}/{take}"),
+        Op::RestoreChanges { .. } => "restored changes".into(),
     }
 }
 
@@ -1018,10 +1472,42 @@ fn entity_order(value: Option<&Value>) -> Vec<&str> {
 #[cfg(test)]
 mod summary_tests {
     use super::op_summary;
-    use storyboard_core::{Author, Op};
+    use storyboard_core::{Author, Format, Layout, Op, Pin, Project, Sticky};
+
+    fn project_with_sticky(resolved: bool) -> Project {
+        Project {
+            schema: "nb-storyboard/v1".into(),
+            title: "Summary test".into(),
+            fps: 24,
+            format: Format {
+                width: 1,
+                height: 1,
+                extra: Default::default(),
+            },
+            scenes: Vec::new(),
+            cuts: Vec::new(),
+            active_cut: None,
+            stickies: vec![Sticky {
+                id: "sticky-1".into(),
+                text: "note".into(),
+                kind: "note".into(),
+                author: Author::Human,
+                pin: Pin::None,
+                reply_to: None,
+                resolved,
+                created: "2026-11-07T00:00:00Z".into(),
+                extra: Default::default(),
+            }],
+            layout: Layout {
+                positions: Default::default(),
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        }
+    }
 
     #[test]
-    fn summaries_use_the_surface_names_and_do_not_claim_a_reopen() {
+    fn summaries_use_the_surface_names_and_report_reopened_threads() {
         let reply = Op::ReplySticky {
             sticky: "sticky-1".into(),
             id: None,
@@ -1030,10 +1516,12 @@ mod summary_tests {
             author: Author::Human,
             created: "2026-11-07T00:00:00Z".into(),
         };
-        assert_eq!(op_summary(&reply, &|_| false), "reply to sticky-1");
+        let open = project_with_sticky(false);
+        let resolved = project_with_sticky(true);
+        assert_eq!(op_summary(&reply, &open, &open), "replied to note");
         assert_eq!(
-            op_summary(&reply, &|sticky| sticky == "sticky-1"),
-            "reply to sticky-1; reopen thread"
+            op_summary(&reply, &resolved, &resolved),
+            "replied to resolved note; reopened thread"
         );
         let across = Op::MoveShotBetweenScenes {
             shot: "shot-1".into(),
@@ -1041,13 +1529,16 @@ mod summary_tests {
             index: 0,
         };
         assert_eq!(
-            op_summary(&across, &|_| false),
-            "move-shot-to-scene shot-1 to scene-2 at 0"
+            op_summary(&across, &open, &open),
+            "moved \u{201c}shot-1\u{201d} to \u{201c}scene-2\u{201d}"
         );
         let within = Op::MoveShot {
             shot: "shot-1".into(),
             index: 2,
         };
-        assert_eq!(op_summary(&within, &|_| false), "reorder-shot shot-1 to 2");
+        assert_eq!(
+            op_summary(&within, &open, &open),
+            "reordered shot \u{201c}shot-1\u{201d}"
+        );
     }
 }

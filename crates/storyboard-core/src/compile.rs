@@ -78,6 +78,8 @@ pub struct CompiledItem {
     pub offset: u64,
     /// The clip that placed the item, or `None` for story order.
     pub clip: Option<String>,
+    /// The innermost shot placement, retained when a cut is nested inside another cut.
+    pub leaf_clip: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -352,6 +354,14 @@ pub(crate) fn analyze_cuts_with_index(
             let source = match &clip.source {
                 ClipSource::Shot(source) => {
                     shot_duration(project, project_index, &source.shot, source.take.as_deref())
+                        .and_then(|duration| {
+                            duration
+                                .map(|(height, frames, items)| {
+                                    clip_audio_frames(project, clip)
+                                        .map(|audio| (height, frames.max(audio), items))
+                                })
+                                .transpose()
+                        })
                         .map_err(SharedCompileError::Other)
                 }
                 ClipSource::Cut(source) => match project_index.cuts.get(&source.cut) {
@@ -542,6 +552,16 @@ fn clip_duration(clip: &Clip, source_duration: u64) -> u64 {
     clip.slot.unwrap_or(input_end - input_start)
 }
 
+fn clip_audio_frames(project: &Project, clip: &Clip) -> Result<u64, CompileError> {
+    clip.source_audio.as_ref().map_or(Ok(0), |audio| {
+        duration_to_frames(
+            project,
+            audio.end - audio.start,
+            &format!("clip {}.source_audio", clip.id),
+        )
+    })
+}
+
 fn saturating_item_add(current: usize, addition: usize) -> usize {
     current
         .saturating_add(addition)
@@ -726,15 +746,37 @@ fn clip_sequence(
     clip: &Clip,
 ) -> Result<Sequence, CompileError> {
     let mut source = match &clip.source {
-        ClipSource::Shot(source) => prepare_clip(
-            project,
-            context,
-            shot_sequence(project, index, &source.shot, source.take.as_deref())?,
-            clip,
-        )?,
+        ClipSource::Shot(source) => {
+            let mut sequence = shot_sequence(project, index, &source.shot, source.take.as_deref())?;
+            let audio_frames = clip_audio_frames(project, clip)?;
+            if audio_frames > sequence.duration {
+                if let Some(last) = sequence.items.last_mut() {
+                    last.end = audio_frames;
+                } else {
+                    let shot = index.shot(project, &source.shot).expect("validated shot");
+                    sequence.items.push(CompiledItem {
+                        start: 0,
+                        end: audio_frames,
+                        shot: source.shot.clone(),
+                        take: source
+                            .take
+                            .clone()
+                            .unwrap_or_else(|| shot.selected_take.clone()),
+                        offset: 0,
+                        clip: None,
+                        leaf_clip: None,
+                    });
+                }
+                sequence.duration = audio_frames;
+            }
+            prepare_clip(project, context, sequence, clip)?
+        }
         ClipSource::Cut(source) => prepare_cut_clip(project, index, context, source, clip)?,
     };
     for item in &mut source.items {
+        if item.leaf_clip.is_none() {
+            item.leaf_clip = Some(clip.id.clone());
+        }
         item.clip = Some(clip.id.clone());
     }
     Ok(source)
@@ -845,6 +887,7 @@ fn shot_sequence(
                 take: take.into(),
                 offset: 0,
                 clip: None,
+                leaf_clip: None,
             },
         )?;
     }
@@ -881,6 +924,7 @@ fn trim_sequence(mut source: Sequence, clip: &Clip) -> Result<Sequence, CompileE
                 take: item.take,
                 offset,
                 clip: item.clip,
+                leaf_clip: item.leaf_clip,
             },
         )?;
     }
@@ -996,6 +1040,7 @@ mod tests {
                 extra: ExtraFields::default(),
                 source_extra: ExtraFields::default(),
             }),
+            source_audio: None,
             in_frame: 0,
             out_frame: None,
             slot: None,
@@ -1011,6 +1056,7 @@ mod tests {
                 extra: ExtraFields::default(),
                 source_extra: ExtraFields::default(),
             }),
+            source_audio: None,
             in_frame: 0,
             out_frame: None,
             slot: None,

@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-use serde_json::Map;
+use serde_json::{Map, json};
 use storyboard_core::{Author, Format, Op};
 use storyboard_store::{
     CommitError, check_refs, commit, create, history, import_source, index, open, open_workspace,
@@ -72,6 +72,212 @@ fn commit_writes_gitignore_log_note_summary_and_archive() {
                 .path()
                 .extension()
                 .is_some_and(|ext| ext == "json"))
+    );
+}
+
+#[test]
+fn commit_summaries_name_titles_and_compact_repeated_batch_actions() {
+    let directory = project();
+    let base = open(directory.path()).expect("open").version;
+    let scene = commit(
+        directory.path(),
+        &base,
+        vec![Op::AddScene {
+            id: Some("opening".into()),
+            title: "Opening".into(),
+            index: None,
+        }],
+        Author::Human,
+        None,
+    )
+    .expect("add scene");
+    assert_eq!(scene.summary, "added scene \u{201c}Opening\u{201d}");
+    let shots = commit(
+        directory.path(),
+        &scene.version,
+        vec![
+            Op::AddShot {
+                scene: "opening".into(),
+                id: Some("arrival".into()),
+                title: "Arrival".into(),
+                index: None,
+            },
+            Op::AddShot {
+                scene: "opening".into(),
+                id: Some("question".into()),
+                title: "Question".into(),
+                index: None,
+            },
+            Op::AddShot {
+                scene: "opening".into(),
+                id: Some("exit".into()),
+                title: "Exit".into(),
+                index: None,
+            },
+        ],
+        Author::Human,
+        None,
+    )
+    .expect("add shots");
+    assert!(shots.summary.contains("Arrival"), "{}", shots.summary);
+    assert!(shots.summary.contains("Opening"), "{}", shots.summary);
+    assert!(shots.summary.chars().count() < 120, "{}", shots.summary);
+
+    let reordered = commit(
+        directory.path(),
+        &shots.version,
+        vec![Op::Batch {
+            ops: vec![
+                Op::MoveShot {
+                    shot: "arrival".into(),
+                    index: 2,
+                },
+                Op::MoveShot {
+                    shot: "question".into(),
+                    index: 0,
+                },
+                Op::MoveShot {
+                    shot: "exit".into(),
+                    index: 1,
+                },
+            ],
+        }],
+        Author::Human,
+        None,
+    )
+    .expect("reorder shots");
+    assert_eq!(reordered.summary, "reordered 3 shots");
+    assert!(!reordered.summary.contains('\n'));
+    assert!(reordered.summary.chars().count() < 120);
+}
+
+#[test]
+fn commit_summaries_cover_panel_cut_clip_ref_and_layout_families() {
+    let directory = project();
+    let base = open(directory.path()).expect("open").version;
+    let scene = commit_one(
+        directory.path(),
+        &base,
+        Op::AddScene {
+            id: Some("opening".into()),
+            title: "Opening".into(),
+            index: None,
+        },
+    );
+    let shot = commit_one(
+        directory.path(),
+        &scene.version,
+        Op::AddShot {
+            scene: "opening".into(),
+            id: Some("arrival".into()),
+            title: "Arrival".into(),
+            index: None,
+        },
+    );
+    let loaded = open(directory.path()).expect("open");
+    let take = loaded.project.scenes[0].shots[0].takes[0].id.clone();
+    let panel = commit_one(
+        directory.path(),
+        &shot.version,
+        Op::AddPanel {
+            shot: "arrival".into(),
+            take: take.clone(),
+            id: Some("close-up".into()),
+            time: None,
+            index: None,
+        },
+    );
+    assert!(panel.summary.contains("Arrival"), "{}", panel.summary);
+
+    let cut = commit_one(
+        directory.path(),
+        &panel.version,
+        Op::AddCut {
+            id: Some("assembly".into()),
+            name: "Assembly".into(),
+            index: None,
+        },
+    );
+    assert!(cut.summary.contains("Assembly"), "{}", cut.summary);
+    let add_clip: Op = serde_json::from_value(serde_json::json!({"add_clip": {
+        "cut": "assembly", "id": "arrival-clip", "source": {"shot": {"shot": "arrival"}}
+    }}))
+    .expect("clip op");
+    let clip = commit_one(directory.path(), &cut.version, add_clip);
+    assert!(clip.summary.contains("Assembly"), "{}", clip.summary);
+
+    let reference = commit_one(
+        directory.path(),
+        &clip.version,
+        Op::AddRef {
+            target: storyboard_core::RefTarget::Shot {
+                shot: "arrival".into(),
+            },
+            reference: "sources/reference.png".into(),
+            index: None,
+        },
+    );
+    assert!(
+        reference.summary.contains("Arrival"),
+        "{}",
+        reference.summary
+    );
+    let layout = commit_one(
+        directory.path(),
+        &reference.version,
+        Op::MoveNode {
+            node: "shot:arrival".into(),
+            position: Some(storyboard_core::Position {
+                x: 10.0,
+                y: 20.0,
+                extra: Map::new(),
+            }),
+        },
+    );
+    assert!(layout.summary.contains("Arrival"), "{}", layout.summary);
+    for record in [panel, cut, clip, reference, layout] {
+        assert!(!record.summary.contains('\n'));
+        assert!(record.summary.chars().count() < 120, "{}", record.summary);
+    }
+}
+
+#[test]
+fn new_summary_generation_does_not_rewrite_existing_log_records() {
+    let directory = project();
+    let base = open(directory.path()).expect("open").version;
+    let first = commit_one(directory.path(), &base, add_scene("opening"));
+    let log_path = directory.path().join("history/log.jsonl");
+    let log = fs::read_to_string(&log_path).expect("read history");
+    let mut records = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("history record"))
+        .collect::<Vec<_>>();
+    records[0]["summary"] = serde_json::json!("legacy add-scene summary");
+    let rewritten = records
+        .iter()
+        .map(|record| serde_json::to_string(record).expect("serialize history record"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&log_path, rewritten).expect("seed a legacy summary");
+
+    commit_one(
+        directory.path(),
+        &first.version,
+        Op::AddScene {
+            id: Some("ending".into()),
+            title: "Ending".into(),
+            index: None,
+        },
+    );
+
+    let records = history(directory.path(), 10).expect("history");
+    assert_eq!(records[1].summary, "legacy add-scene summary");
+    let on_disk = fs::read_to_string(log_path).expect("read final history");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(on_disk.lines().next().expect("first record"))
+            .expect("first history record")["summary"],
+        "legacy add-scene summary"
     );
 }
 
@@ -210,6 +416,36 @@ fn history_undo_commits_latest_author_inverse_through_commit() {
 }
 
 #[test]
+fn undo_can_repeat_an_edit_after_returning_to_the_same_content_version() {
+    let directory = project();
+    let initial = open(directory.path()).expect("open").version;
+    let first = commit_one(directory.path(), &initial, add_scene("scene-1"));
+    let back_to_initial =
+        undo(directory.path(), &first.version, Author::Human, 1).expect("undo first edit");
+    assert_eq!(back_to_initial.version, initial);
+
+    let repeated = commit_one(
+        directory.path(),
+        &back_to_initial.version,
+        add_scene("scene-1"),
+    );
+    assert_eq!(
+        repeated.version, first.version,
+        "the content hashes must collide"
+    );
+    let undone_again =
+        undo(directory.path(), &repeated.version, Author::Human, 1).expect("undo repeated edit");
+    assert_eq!(undone_again.version, initial);
+    assert!(
+        open(directory.path())
+            .expect("open")
+            .project
+            .scenes
+            .is_empty()
+    );
+}
+
+#[test]
 fn history_writes_an_interval_snapshot() {
     let directory = project();
     let mut base = open(directory.path()).expect("open").version;
@@ -268,6 +504,79 @@ fn sources_scan_tracks_relative_image_dimensions_and_refs() {
 }
 
 #[test]
+fn sources_scan_tracks_image_layers_and_reports_missing_layer_sources() {
+    let directory = project();
+    let scene = commit_one(
+        directory.path(),
+        &open(directory.path()).expect("open").version,
+        add_scene("scene-1"),
+    );
+    let shot = commit_one(
+        directory.path(),
+        &scene.version,
+        add_shot("scene-1", "shot-1"),
+    );
+    let loaded = open(directory.path()).expect("open");
+    let take = loaded.project.scenes[0].shots[0].takes[0].id.clone();
+    let panel = loaded.project.scenes[0].shots[0].takes[0].panels[0]
+        .id
+        .clone();
+    fs::write(directory.path().join("sources/present.png"), b"present").expect("source");
+
+    commit_one(
+        directory.path(),
+        &shot.version,
+        Op::Batch {
+            ops: vec![
+                Op::AddLayer {
+                    shot: "shot-1".into(),
+                    take: take.clone(),
+                    panel: panel.clone(),
+                    id: Some("layer-present".into()),
+                    layer_type: "image".into(),
+                    fields: [("src".into(), json!("sources/present.png"))]
+                        .into_iter()
+                        .collect(),
+                    index: None,
+                },
+                Op::AddLayer {
+                    shot: "shot-1".into(),
+                    take: take.clone(),
+                    panel: panel.clone(),
+                    id: Some("layer-missing".into()),
+                    layer_type: "image".into(),
+                    fields: [("src".into(), json!("sources/gone.png"))]
+                        .into_iter()
+                        .collect(),
+                    index: None,
+                },
+            ],
+        },
+    );
+
+    let sources = scan_sources(directory.path()).expect("scan");
+    let present = sources
+        .iter()
+        .find(|entry| entry.path == "sources/present.png")
+        .expect("present source");
+    assert_eq!(
+        present.uses[0].target,
+        format!("layer:shot-1/{take}/{panel}/layer-present")
+    );
+    let missing = check_refs(
+        directory.path(),
+        &open(directory.path()).expect("open").project,
+    )
+    .expect("missing refs");
+    assert_eq!(missing.len(), 1);
+    assert_eq!(missing[0].path, "sources/gone.png");
+    assert_eq!(
+        missing[0].target,
+        format!("layer:shot-1/{take}/{panel}/layer-missing")
+    );
+}
+
+#[test]
 fn sources_import_stays_inside_sources_and_never_overwrites() {
     let directory = project();
     let input = tempfile::NamedTempFile::new().expect("input");
@@ -320,6 +629,7 @@ fn workspace_index_is_relative_and_warm_cache_survives_folder_rename() {
     assert_eq!(entries[0].path, std::path::PathBuf::from("one"));
     assert_eq!(entries[0].scene_count, 1);
     assert_eq!(entries[0].shot_count, 1);
+    assert_eq!(entries[0].fps, 24);
     assert_eq!(entries[0].aspect, "16:9");
     assert!(project_dir.join(".cache/index.json").is_file());
     fs::rename(&project_dir, workspace_dir.path().join("renamed")).expect("rename");
@@ -328,4 +638,32 @@ fn workspace_index_is_relative_and_warm_cache_survives_folder_rename() {
         index(&renamed).expect("warm index")[0].path,
         std::path::PathBuf::from("renamed")
     );
+}
+
+#[test]
+fn workspace_index_rebuilds_a_cache_that_predates_fps() {
+    let workspace_dir = tempfile::tempdir().expect("workspace");
+    let project_dir = workspace_dir.path().join("one");
+    create(&project_dir, "One", 25, format()).expect("create");
+    let workspace = open_workspace(workspace_dir.path()).expect("workspace");
+    assert_eq!(index(&workspace).expect("cold index")[0].fps, 25);
+
+    let cache_path = project_dir.join(".cache/index.json");
+    let mut cache: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cache_path).expect("cache")).expect("cache JSON");
+    cache["entry"]
+        .as_object_mut()
+        .expect("cache entry")
+        .remove("fps");
+    fs::write(
+        &cache_path,
+        serde_json::to_vec(&cache).expect("old cache JSON"),
+    )
+    .expect("old cache");
+
+    assert_eq!(index(&workspace).expect("rebuilt index")[0].fps, 25);
+    let rebuilt: serde_json::Value =
+        serde_json::from_slice(&fs::read(cache_path).expect("rebuilt cache"))
+            .expect("rebuilt cache JSON");
+    assert_eq!(rebuilt["entry"]["fps"], 25);
 }

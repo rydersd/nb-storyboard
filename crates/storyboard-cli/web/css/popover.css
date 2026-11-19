@@ -1,0 +1,21 @@
+/* Popovers, menus and the scrim. */
+
+/* ---------------------------------------------------------------- popovers */
+.popover {
+  position: fixed; z-index: 40; background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--r-frame);
+  box-shadow: var(--pop-shadow); padding: 4px;
+}
+.menu { min-width: 200px; display: grid; }
+.menu button {
+  text-align: left; background: none; border: 0; padding: 5px 10px 5px 24px; border-radius: var(--r-node); position: relative;
+  white-space: nowrap;
+}
+.menu button:hover, .menu button:focus-visible { background: var(--surface-2); outline: none; }
+.menu button.danger { color: var(--status-changes); }
+.menu button .mark { position: absolute; left: 9px; top: 50%; width: 7px; height: 7px; margin-top: -3.5px; border-radius: 50%; border: 1px solid var(--text-dim); }
+.menu button .mark.on { background: var(--text); border-color: var(--text); }
+.menu button .mark.status { border: 0; }
+.menu button .key { float: right; margin-left: 16px; color: var(--text-faint); font-family: var(--mono); }
+.menu .sep { height: 1px; background: var(--border); margin: 4px 0; }
+.menu button.viewing { color: var(--cut); }
+.scrim { position: fixed; inset: 0; z-index: 39; }

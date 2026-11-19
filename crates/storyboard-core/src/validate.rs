@@ -91,6 +91,52 @@ pub fn validate(project: &Project) -> Vec<ValidationIssue> {
                     "duration must be from 0 to 3600 seconds",
                 ));
             }
+            if let Some(movie) = &shot.source_movie {
+                paths(
+                    &mut issues,
+                    &format!("{path}.source_movie.src"),
+                    std::slice::from_ref(&movie.src),
+                );
+                if !movie.src.starts_with("sources/") {
+                    issues.push(ValidationIssue::new(
+                        format!("{path}.source_movie.src"),
+                        "movie must be inside sources/",
+                    ));
+                }
+                if !movie.start.is_finite()
+                    || !movie.end.is_finite()
+                    || movie.start < 0.0
+                    || movie.end <= movie.start
+                {
+                    issues.push(ValidationIssue::new(
+                        format!("{path}.source_movie"),
+                        "movie end must be after a nonnegative start",
+                    ));
+                }
+            }
+            if let Some(audio) = &shot.source_audio {
+                paths(
+                    &mut issues,
+                    &format!("{path}.source_audio.src"),
+                    std::slice::from_ref(&audio.src),
+                );
+                if !audio.src.starts_with("sources/") {
+                    issues.push(ValidationIssue::new(
+                        format!("{path}.source_audio.src"),
+                        "audio must be inside sources/",
+                    ));
+                }
+                if !audio.start.is_finite()
+                    || !audio.end.is_finite()
+                    || audio.start < 0.0
+                    || audio.end <= audio.start
+                {
+                    issues.push(ValidationIssue::new(
+                        format!("{path}.source_audio"),
+                        "audio end must be after a nonnegative start",
+                    ));
+                }
+            }
             if !["draft", "review", "approved", "changes"].contains(&shot.status.as_str()) {
                 issues.push(ValidationIssue::options(
                     format!("{path}.status"),
@@ -213,6 +259,35 @@ pub fn validate(project: &Project) -> Vec<ValidationIssue> {
                     format!("{path}.slot"),
                     "slot must be greater than zero",
                 ));
+            }
+            if let Some(audio) = &clip.source_audio {
+                paths(
+                    &mut issues,
+                    &format!("{path}.source_audio.src"),
+                    std::slice::from_ref(&audio.src),
+                );
+                if !audio.src.starts_with("sources/") {
+                    issues.push(ValidationIssue::new(
+                        format!("{path}.source_audio.src"),
+                        "audio must be inside sources/",
+                    ));
+                }
+                if !audio.start.is_finite()
+                    || !audio.end.is_finite()
+                    || audio.start < 0.0
+                    || audio.end <= audio.start
+                {
+                    issues.push(ValidationIssue::new(
+                        format!("{path}.source_audio"),
+                        "audio end must be after a nonnegative start",
+                    ));
+                }
+                if matches!(clip.source, ClipSource::Cut(_)) {
+                    issues.push(ValidationIssue::new(
+                        format!("{path}.source_audio"),
+                        "placement audio requires a shot clip",
+                    ));
+                }
             }
             match &clip.source {
                 ClipSource::Shot(source) => {

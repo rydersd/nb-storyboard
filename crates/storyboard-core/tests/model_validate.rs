@@ -1,9 +1,114 @@
-use storyboard_core::{Project, validate};
+use storyboard_core::{AudioRange, MovieRange, Project, validate};
 
 const SMALL: &str = include_str!("fixtures/small.json");
 
 fn fixture() -> Project {
     serde_json::from_str(SMALL).expect("the small fixture is a project")
+}
+
+#[test]
+fn movie_range_survives_roundtrip_and_rejects_invalid_time_or_path() {
+    let mut project = fixture();
+    let shot = &mut project.scenes[0].shots[0];
+    shot.source_movie = Some(MovieRange {
+        src: "sources/movies/rough.mp4".into(),
+        start: 2.5,
+        end: 6.0,
+    });
+    assert!(validate(&project).is_empty());
+    let written = project.to_pretty_json().unwrap();
+    let reopened: Project = serde_json::from_str(&written).unwrap();
+    assert_eq!(
+        reopened.scenes[0].shots[0].source_movie,
+        project.scenes[0].shots[0].source_movie
+    );
+
+    project.scenes[0].shots[0]
+        .source_movie
+        .as_mut()
+        .unwrap()
+        .end = 2.5;
+    assert!(
+        validate(&project)
+            .iter()
+            .any(|issue| issue.field.contains("source_movie"))
+    );
+    let movie = project.scenes[0].shots[0].source_movie.as_mut().unwrap();
+    movie.end = 6.0;
+    movie.src = "../rough.mp4".into();
+    assert!(
+        validate(&project)
+            .iter()
+            .any(|issue| issue.field.contains("source_movie.src"))
+    );
+}
+
+#[test]
+fn audio_range_survives_roundtrip_and_rejects_invalid_time_or_path() {
+    let mut project = fixture();
+    project.scenes[0].shots[0].source_audio = Some(AudioRange {
+        src: "sources/audio/voice.wav".into(),
+        start: 1.0,
+        end: 4.0,
+    });
+    assert!(validate(&project).is_empty());
+    let reopened: Project = serde_json::from_str(&project.to_pretty_json().unwrap()).unwrap();
+    assert_eq!(
+        reopened.scenes[0].shots[0].source_audio,
+        project.scenes[0].shots[0].source_audio
+    );
+    project.scenes[0].shots[0]
+        .source_audio
+        .as_mut()
+        .unwrap()
+        .end = 1.0;
+    assert!(
+        validate(&project)
+            .iter()
+            .any(|issue| issue.field.contains("source_audio"))
+    );
+    let audio = project.scenes[0].shots[0].source_audio.as_mut().unwrap();
+    audio.end = 4.0;
+    audio.src = "../voice.wav".into();
+    assert!(
+        validate(&project)
+            .iter()
+            .any(|issue| issue.field.contains("source_audio.src"))
+    );
+}
+
+#[test]
+fn placement_audio_roundtrips_and_rejects_uncontained_or_nested_sources() {
+    let mut project = fixture();
+    project.cuts[0].clips[0].source_audio = Some(AudioRange {
+        src: "sources/imported-audio/voice/original.wav".into(),
+        start: 0.0,
+        end: 3.0,
+    });
+    assert!(validate(&project).is_empty());
+    let reopened: Project = serde_json::from_str(&project.to_pretty_json().unwrap()).unwrap();
+    assert_eq!(
+        reopened.cuts[0].clips[0].source_audio,
+        project.cuts[0].clips[0].source_audio
+    );
+
+    project.cuts[0].clips[0].source_audio.as_mut().unwrap().src = "../voice.wav".into();
+    assert!(
+        validate(&project)
+            .iter()
+            .any(|issue| issue.field.contains("source_audio.src"))
+    );
+    project.cuts[0].clips[0].source_audio = None;
+    project.cuts[0].clips[1].source_audio = Some(AudioRange {
+        src: "sources/imported-audio/voice/original.wav".into(),
+        start: 0.0,
+        end: 3.0,
+    });
+    assert!(
+        validate(&project)
+            .iter()
+            .any(|issue| issue.message.contains("requires a shot clip"))
+    );
 }
 
 #[test]

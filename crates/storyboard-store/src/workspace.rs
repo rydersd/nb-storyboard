@@ -25,6 +25,7 @@ pub struct Workspace {
 pub struct IndexEntry {
     pub path: PathBuf,
     pub title: String,
+    pub fps: u32,
     pub scene_count: usize,
     pub shot_count: usize,
     pub duration: u64,
@@ -102,6 +103,7 @@ fn broken_entry(root: &Path, dir: &Path, error: &StoreError) -> IndexEntry {
     IndexEntry {
         path,
         title,
+        fps: 0,
         scene_count: 0,
         shot_count: 0,
         duration: 0,
@@ -146,6 +148,7 @@ fn index_project(root: &Path, dir: &Path) -> Result<IndexEntry, StoreError> {
     let entry = IndexEntry {
         path,
         title: project.title,
+        fps: project.fps,
         scene_count: project.scenes.len(),
         shot_count,
         duration,

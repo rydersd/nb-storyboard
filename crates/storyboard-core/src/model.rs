@@ -200,6 +200,10 @@ pub struct Shot {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub notes: String,
     pub duration: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_movie: Option<MovieRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_audio: Option<AudioRange>,
     #[serde(default = "default_status", skip_serializing_if = "is_draft")]
     pub status: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -210,6 +214,24 @@ pub struct Shot {
     pub refs: Vec<String>,
     #[serde(flatten, default)]
     pub extra: ExtraFields,
+}
+
+/// Where a board shot came from in an imported movie. Time is measured from the source start.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MovieRange {
+    pub src: String,
+    pub start: f64,
+    pub end: f64,
+}
+
+/// A voice-over or other audio source attached to a shot. Times are within the source file.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AudioRange {
+    pub src: String,
+    pub start: f64,
+    pub end: f64,
 }
 
 fn default_status() -> String {
@@ -333,6 +355,8 @@ pub struct Cut {
 pub struct Clip {
     pub id: String,
     pub source: ClipSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_audio: Option<AudioRange>,
     #[serde(rename = "in", default, skip_serializing_if = "is_zero")]
     pub in_frame: u64,
     #[serde(rename = "out", default, skip_serializing_if = "Option::is_none")]
